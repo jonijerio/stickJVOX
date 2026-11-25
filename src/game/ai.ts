@@ -201,6 +201,7 @@ export function computeBotInput(
   if (
     bot.weapon !== 'fists' &&
     bot.weapon !== 'katana' &&
+    bot.weapon !== 'lightsaber' &&
     bot.ammo <= 1 &&
     bestDist < 260 &&
     bot.aiArchetype === 'trickster' &&
@@ -211,6 +212,7 @@ export function computeBotInput(
 
   // Attack decision
   const spec = WEAPONS[bot.weapon];
+  const isRapidAuto = bot.weapon === 'smg' || bot.weapon === 'minigun';
   const effectiveRange = spec.isMelee ? spec.range + 22 : Math.min(spec.range, 620);
 
   if (bot.aiThinkTimer <= 0) {
@@ -224,11 +226,11 @@ export function computeBotInput(
     bot.facing = desiredFace;
     bot.aimAngle = Math.atan2(dyToTarget, dxToTarget) + (Math.random() * 2 - 1) * tuning.accuracySpread;
     input.attackJustPressed = true;
-    input.attackHeld = bot.weapon === 'smg';
-    if (bot.weapon !== 'smg') {
+    input.attackHeld = isRapidAuto;
+    if (!isRapidAuto) {
       bot.aiAttackDecision = false;
     }
-  } else if (bot.weapon === 'smg' && bot.aiAttackDecision) {
+  } else if (isRapidAuto && bot.aiAttackDecision) {
     bot.facing = desiredFace;
     bot.aimAngle = Math.atan2(dyToTarget, dxToTarget);
     input.attackHeld = true;

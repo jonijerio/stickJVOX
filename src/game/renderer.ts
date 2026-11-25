@@ -10,6 +10,7 @@ import {
   AfterimageGhost,
   ArenaDefinition,
   BeamEffect,
+  BlackHoleVortex,
   Fighter,
   FloatingCallout,
   ImpactFlashEffect,
@@ -17,9 +18,11 @@ import {
   Projectile,
   ScreenFlashState,
   SlashArcEffect,
+  StuckSpear,
   SurfaceDecal,
   WeaponId,
   WeaponPickup,
+  WeatherState,
 } from './types';
 import { WEAPONS } from './weapons';
 
@@ -110,13 +113,21 @@ export function renderFrame(
   elapsedTime: number,
   victoryBloomIntensity = 0,
   isGameover = false,
-  killCamVignette = 0
+  killCamVignette = 0,
+  weather: WeatherState | null = null,
+  blackHoles: BlackHoleVortex[] = [],
+  stuckSpears: StuckSpear[] = []
 ): void {
   ctx.save();
 
   // 1. Atmospheric Arena Sky Backdrop (pre-rendered offscreen canvas)
   const bg = getOrBuildBackground(viewW, viewH, arena);
   ctx.drawImage(bg, 0, 0, viewW, viewH);
+
+  // 1b. Dynamic Weather Sky Haze & Background Gusts
+  if (weather && weather.kind !== 'clear' && weather.intensity > 0.01) {
+    drawWeatherBackdrop(ctx, viewW, viewH, weather, elapsedTime);
+  }
 
   // 2. Camera Transform (with multi-frequency trauma^2 vibration, rotational roll & directional kick)
   const shakePower = camera.trauma * camera.trauma;
@@ -150,6 +161,11 @@ export function renderFrame(
   }
   drawSurfaceDecals(ctx, arena.platforms, decals);
 
+  // 4b. Wall/Platform-Stuck Spears & Blades
+  for (const sp of stuckSpears) {
+    drawStuckSpear(ctx, sp, elapsedTime);
+  }
+
   // 5. Laser Grid Hazards (Idle emitters -> Telegraph line -> Active beam)
   for (const laser of arena.lasers) {
     drawLaserHazard(ctx, laser, elapsedTime);
@@ -158,6 +174,11 @@ export function renderFrame(
   // 6. Pendulum Wrecking Ball Hazards
   for (const pend of arena.pendulums) {
     drawPendulumHazard(ctx, pend, elapsedTime);
+  }
+
+  // 6b. Active Black Hole Gravity Vortices
+  for (const bh of blackHoles) {
+    drawBlackHoleVortex(ctx, bh, elapsedTime);
   }
 
   // 7. Weapon Pickups (with parachutes & soft halo)
@@ -189,7 +210,7 @@ export function renderFrame(
   // 10. Projectiles & Thrown Weapons
   for (const p of projectiles) {
     if (!p.active) continue;
-    drawProjectile(ctx, p);
+    drawProjectile(ctx, p, elapsedTime);
   }
 
   // 11. Pooled Particle Ring Buffer + Comic Starbursts + Victory Light Flare + Floating Callouts
@@ -199,6 +220,11 @@ export function renderFrame(
     drawVictoryLightFlare(ctx, celebratingWinner, victoryBloom);
   }
   drawCallouts(ctx, callouts);
+
+  // 11b. World-Space Dynamic Weather Foreground (localized snowstorm flakes, roof-aware acid rain, gale wind streaks)
+  if (weather && weather.kind !== 'clear' && weather.intensity > 0.01) {
+    drawWeatherWorldLayer(ctx, arena, weather, elapsedTime);
+  }
 
   ctx.restore();
 
@@ -926,18 +952,164 @@ function drawWeaponGraphic(
       ctx.fillStyle = '#22D3EE';
       ctx.fillRect(4, -2, 16, 3);
       break;
+    case 'minigun':
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(-11, -7, 15, 12);
+      ctx.fillStyle = '#94A3B8';
+      ctx.fillRect(4, -5, 19, 2.2);
+      ctx.fillRect(4, -1.2, 21, 2.4);
+      ctx.fillRect(4, 2.8, 19, 2.2);
+      ctx.fillStyle = accent;
+      ctx.fillRect(-3, 5, 8, 5);
+      break;
+    case 'lightsaber':
+      ctx.fillStyle = '#475569';
+      ctx.fillRect(-5, -3, 9, 6);
+      ctx.fillStyle = '#38BDF8';
+      ctx.fillRect(4, -2.6, 29, 5.2);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(5, -1, 27, 2);
+      break;
+    case 'spear':
+      ctx.fillStyle = '#92400E';
+      ctx.fillRect(-16, -2, 30, 4);
+      ctx.fillStyle = '#E2E8F0';
+      ctx.beginPath();
+      ctx.moveTo(14, -5.5);
+      ctx.lineTo(26, 0);
+      ctx.lineTo(14, 5.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#38BDF8';
+      ctx.fillRect(-18, -3.5, 4, 7);
+      break;
+    case 'snake_gun':
+      ctx.fillStyle = '#166534';
+      ctx.fillRect(-4, -5, 18, 7);
+      ctx.fillStyle = '#4ADE80';
+      ctx.fillRect(10, -4, 7, 5);
+      ctx.fillStyle = '#14532D';
+      ctx.fillRect(-3, 1, 5, 7);
+      ctx.fillStyle = '#FACC15';
+      ctx.fillRect(12, -3, 2, 2);
+      break;
+    case 'blackhole_gun':
+      ctx.fillStyle = '#312E81';
+      ctx.fillRect(-8, -6, 24, 10);
+      ctx.fillStyle = '#A855F7';
+      ctx.beginPath();
+      ctx.arc(14, -1, 5.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#090C12';
+      ctx.beginPath();
+      ctx.arc(14, -1, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      break;
     default:
       break;
   }
   ctx.restore();
 }
 
-function drawProjectile(ctx: CanvasRenderingContext2D, p: Projectile): void {
+function drawProjectile(ctx: CanvasRenderingContext2D, p: Projectile, elapsedTime: number): void {
   ctx.save();
   if (p.isThrownWeapon && p.thrownWeaponId) {
     ctx.translate(p.x, p.y);
     ctx.rotate(p.spinAngle ?? 0);
     drawWeaponGraphic(ctx, p.thrownWeaponId, 0, 0, 1, 0, p.color);
+    ctx.restore();
+    return;
+  }
+
+  if (p.isSnake) {
+    const dir = p.vx >= 0 ? 1 : -1;
+    const phase = (p.snakePhase ?? 0) + elapsedTime * 16;
+    ctx.translate(p.x, p.y);
+    ctx.scale(dir, 1);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // Slithering green serpent body
+    ctx.strokeStyle = '#14532D';
+    ctx.lineWidth = 8.5;
+    ctx.beginPath();
+    ctx.moveTo(-22, Math.sin(phase - 2.4) * 5);
+    ctx.quadraticCurveTo(-11, Math.sin(phase - 1.2) * 6, 0, Math.sin(phase) * 3);
+    ctx.lineTo(8, 0);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#4ADE80';
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(-22, Math.sin(phase - 2.4) * 5);
+    ctx.quadraticCurveTo(-11, Math.sin(phase - 1.2) * 6, 0, Math.sin(phase) * 3);
+    ctx.lineTo(8, 0);
+    ctx.stroke();
+
+    // Viper head, yellow eye & forked red tongue
+    ctx.fillStyle = '#22C55E';
+    ctx.beginPath();
+    ctx.ellipse(9, 0, 6.5, 4.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#FACC15';
+    ctx.beginPath();
+    ctx.arc(10.5, -1.6, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (Math.sin(elapsedTime * 22 + p.id) > -0.2) {
+      ctx.strokeStyle = '#EF4444';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(15, 0.5);
+      ctx.lineTo(20, 0.5);
+      ctx.lineTo(22.5, -1.5);
+      ctx.moveTo(20, 0.5);
+      ctx.lineTo(22.5, 2.5);
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
+
+  if (p.isBlackHole) {
+    ctx.translate(p.x, p.y);
+    ctx.rotate(elapsedTime * 8);
+    const gr = ctx.createRadialGradient(0, 0, 2, 0, 0, 18);
+    gr.addColorStop(0, '#05050A');
+    gr.addColorStop(0.45, '#9333EA');
+    gr.addColorStop(1, 'rgba(168, 85, 247, 0)');
+    ctx.fillStyle = gr;
+    ctx.beginPath();
+    ctx.arc(0, 0, 18, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#090C12';
+    ctx.beginPath();
+    ctx.arc(0, 0, 6.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#E9D5FF';
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (p.isSpear) {
+    const ang = Math.atan2(p.vy, p.vx);
+    ctx.translate(p.x, p.y);
+    ctx.rotate(ang);
+    ctx.fillStyle = '#92400E';
+    ctx.fillRect(-20, -2, 34, 4);
+    ctx.fillStyle = '#F8FAFC';
+    ctx.beginPath();
+    ctx.moveTo(14, -5.5);
+    ctx.lineTo(28, 0);
+    ctx.lineTo(14, 5.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#38BDF8';
+    ctx.fillRect(-22, -3.5, 5, 7);
     ctx.restore();
     return;
   }
@@ -1415,6 +1587,232 @@ function drawVictoryLightFlare(
     ctx.beginPath();
     ctx.arc(gx, cy, gr, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+function drawStuckSpear(
+  ctx: CanvasRenderingContext2D,
+  sp: StuckSpear,
+  elapsedTime: number
+): void {
+  const blink = sp.life < 2 ? 0.4 + 0.6 * Math.abs(Math.sin(elapsedTime * 10)) : 1;
+  ctx.save();
+  ctx.globalAlpha = blink;
+  ctx.translate(sp.x, sp.y);
+  ctx.rotate(sp.angle);
+
+  if (sp.weaponId === 'lightsaber') {
+    ctx.fillStyle = '#475569';
+    ctx.fillRect(-34, -3, 10, 6);
+    ctx.fillStyle = sp.color;
+    ctx.fillRect(-24, -2.5, 28, 5);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(-23, -1, 26, 2);
+  } else {
+    ctx.fillStyle = '#92400E';
+    ctx.fillRect(-38, -2, 34, 4);
+    ctx.fillStyle = '#E2E8F0';
+    ctx.beginPath();
+    ctx.moveTo(-4, -5);
+    ctx.lineTo(8, 0);
+    ctx.lineTo(-4, 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#38BDF8';
+    ctx.fillRect(-40, -3.5, 5, 7);
+  }
+  ctx.restore();
+}
+
+function drawBlackHoleVortex(
+  ctx: CanvasRenderingContext2D,
+  bh: BlackHoleVortex,
+  elapsedTime: number
+): void {
+  const t = Math.max(0, Math.min(1, bh.life / bh.maxLife));
+  const openScale = Math.min(1, (bh.maxLife - bh.life) / 0.25);
+  const coreR = bh.radius * (0.85 + 0.15 * Math.sin(elapsedTime * 12)) * openScale;
+
+  ctx.save();
+  ctx.translate(bh.x, bh.y);
+
+  // Outer gravitational pull distortion aura
+  const aura = ctx.createRadialGradient(0, 0, coreR * 0.5, 0, 0, bh.pullRadius);
+  aura.addColorStop(0, 'rgba(147, 51, 234, 0.36)');
+  aura.addColorStop(0.42, 'rgba(88, 28, 135, 0.14)');
+  aura.addColorStop(1, 'rgba(88, 28, 135, 0)');
+  ctx.fillStyle = aura;
+  ctx.beginPath();
+  ctx.arc(0, 0, bh.pullRadius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Rotating spiral accretion arcs
+  ctx.rotate(bh.spin);
+  for (let i = 0; i < 4; i++) {
+    ctx.save();
+    ctx.rotate((i / 4) * Math.PI * 2);
+    ctx.strokeStyle = i % 2 === 0 ? 'rgba(192, 132, 252, 0.72)' : 'rgba(56, 189, 248, 0.52)';
+    ctx.lineWidth = 3 * openScale;
+    ctx.beginPath();
+    ctx.arc(0, 0, coreR * 2.2, 0.15, 1.45);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(0, 0, coreR * 3.4, 0.4, 1.35);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Event horizon pitch-black core + bright violet corona rim
+  ctx.fillStyle = '#030308';
+  ctx.beginPath();
+  ctx.arc(0, 0, Math.max(4, coreR), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = t < 0.2 ? '#FDE047' : '#C084FC';
+  ctx.lineWidth = 3.2;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawWeatherBackdrop(
+  ctx: CanvasRenderingContext2D,
+  viewW: number,
+  viewH: number,
+  weather: WeatherState,
+  elapsedTime: number
+): void {
+  const alpha = Math.min(1, weather.intensity);
+  ctx.save();
+
+  if (weather.kind === 'snowstorm') {
+    ctx.fillStyle = `rgba(186, 230, 253, ${0.09 * alpha})`;
+    ctx.fillRect(0, 0, viewW, viewH);
+  } else if (weather.kind === 'acid_rain') {
+    ctx.fillStyle = `rgba(34, 197, 94, ${0.09 * alpha})`;
+    ctx.fillRect(0, 0, viewW, viewH);
+  } else if (weather.kind === 'gale_wind') {
+    ctx.fillStyle = `rgba(148, 163, 184, ${0.08 * alpha})`;
+    ctx.fillRect(0, 0, viewW, viewH);
+    // Sweeping sky gust ribbons across background
+    ctx.strokeStyle = `rgba(226, 232, 240, ${0.18 * alpha})`;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 9; i++) {
+      const span = viewW + 260;
+      const speed = (420 + (i % 3) * 140) * weather.windDir;
+      const rawX = (i * 190 + elapsedTime * speed) % span;
+      const x = rawX < -130 ? rawX + span : rawX;
+      const y = ((i * 97) % (viewH * 0.8)) + 50 + Math.sin(elapsedTime * 3 + i) * 14;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.quadraticCurveTo(x + weather.windDir * 55, y - 10, x + weather.windDir * 120, y + 4);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawWeatherWorldLayer(
+  ctx: CanvasRenderingContext2D,
+  arena: ArenaDefinition,
+  weather: WeatherState,
+  elapsedTime: number
+): void {
+  const alpha = Math.min(1, weather.intensity);
+  ctx.save();
+
+  if (weather.kind === 'snowstorm') {
+    const left = weather.zoneCenterX - weather.zoneHalfWidth;
+    const right = weather.zoneCenterX + weather.zoneHalfWidth;
+    const band = ctx.createLinearGradient(left, 0, right, 0);
+    band.addColorStop(0, 'rgba(186, 230, 253, 0)');
+    band.addColorStop(0.2, `rgba(186, 230, 253, ${0.11 * alpha})`);
+    band.addColorStop(0.5, `rgba(224, 242, 254, ${0.16 * alpha})`);
+    band.addColorStop(0.8, `rgba(186, 230, 253, ${0.11 * alpha})`);
+    band.addColorStop(1, 'rgba(186, 230, 253, 0)');
+    ctx.fillStyle = band;
+    ctx.fillRect(left, 0, weather.zoneHalfWidth * 2, arena.height);
+
+    // Swirling slanted snowflakes inside localized blizzard zone
+    ctx.fillStyle = `rgba(240, 249, 255, ${0.85 * alpha})`;
+    const count = 52;
+    for (let i = 0; i < count; i++) {
+      const frac = ((i * 73) % 100) / 100;
+      const fx =
+        weather.zoneCenterX -
+        weather.zoneHalfWidth +
+        ((frac * weather.zoneHalfWidth * 2 + elapsedTime * weather.windDir * (140 + (i % 4) * 35)) %
+          (weather.zoneHalfWidth * 2) +
+          weather.zoneHalfWidth * 2) %
+          (weather.zoneHalfWidth * 2);
+      const fy = ((i * 59 + elapsedTime * (190 + (i % 5) * 40)) % (arena.height - 20));
+      const r = 1.8 + (i % 3) * 1.1;
+      ctx.beginPath();
+      ctx.arc(fx, fy, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (weather.kind === 'acid_rain') {
+    const left = weather.zoneCenterX - weather.zoneHalfWidth;
+    const right = weather.zoneCenterX + weather.zoneHalfWidth;
+    const band = ctx.createLinearGradient(left, 0, right, 0);
+    band.addColorStop(0, 'rgba(34, 197, 94, 0)');
+    band.addColorStop(0.2, `rgba(34, 197, 94, ${0.1 * alpha})`);
+    band.addColorStop(0.5, `rgba(74, 222, 128, ${0.14 * alpha})`);
+    band.addColorStop(0.8, `rgba(34, 197, 94, ${0.1 * alpha})`);
+    band.addColorStop(1, 'rgba(34, 197, 94, 0)');
+    ctx.fillStyle = band;
+    ctx.fillRect(left, 0, weather.zoneHalfWidth * 2, arena.height);
+
+    ctx.strokeStyle = `rgba(74, 222, 128, ${0.72 * alpha})`;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    const drops = 46;
+    for (let i = 0; i < drops; i++) {
+      const fx =
+        weather.zoneCenterX -
+        weather.zoneHalfWidth +
+        (((i * 97 + elapsedTime * weather.windDir * 70) % (weather.zoneHalfWidth * 2) +
+          weather.zoneHalfWidth * 2) %
+          (weather.zoneHalfWidth * 2));
+      let maxY = arena.height - 10;
+      for (const p of arena.platforms) {
+        if (p.kind === 'destructible' && (p.hp ?? 1) <= 0) continue;
+        if (fx >= p.x && fx <= p.x + p.w && p.y < maxY) {
+          maxY = p.y;
+        }
+      }
+      const fy = (i * 83 + elapsedTime * 580) % Math.max(120, maxY);
+      ctx.beginPath();
+      ctx.moveTo(fx, fy);
+      ctx.lineTo(fx + weather.windDir * 5, fy + 16);
+      ctx.stroke();
+
+      // Acid splash bubble on roof/platform top
+      if (maxY < arena.height - 20 && i % 3 === 0) {
+        const pop = Math.abs(Math.sin(elapsedTime * 11 + i));
+        ctx.fillStyle = `rgba(134, 239, 172, ${0.45 * alpha * pop})`;
+        ctx.beginPath();
+        ctx.arc(fx, maxY - pop * 4, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  } else if (weather.kind === 'gale_wind') {
+    ctx.strokeStyle = `rgba(226, 232, 240, ${0.32 * alpha})`;
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 16; i++) {
+      const speed = (620 + (i % 4) * 140) * weather.windDir;
+      const sx =
+        ((i * 150 + elapsedTime * speed) % arena.width + arena.width) % arena.width;
+      const sy = 55 + ((i * 89) % (arena.height - 140));
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + weather.windDir * 44, sy + Math.sin(elapsedTime * 6 + i) * 3);
+      ctx.stroke();
+    }
   }
 
   ctx.restore();

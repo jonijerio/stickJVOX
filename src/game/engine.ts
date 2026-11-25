@@ -11,21 +11,27 @@ import { ParticleSystem } from './particles';
 import { CameraState, renderFrame } from './renderer';
 import {
   CameraShakeEventKind,
+  computeBlackHolePull,
   computeCameraShakeImpulse,
   computeKillCamState,
+  computeSnakeSteering,
   computeVictoryLimbEmitters,
   computeVictoryShakeResponse,
+  computeWeatherPhysicsInfluence,
+  createWeatherState,
   evaluateMatchWinner,
   evaluateRoundOutcome,
   getLaserPhase,
   getModeRoster,
   getPendulumPosition,
+  getWeatherLabel,
   intersectsPlatform,
   pickRandomArenaDrop,
   pickRandomVictoryPose,
   pointToSegmentDistance,
   resolveHit,
   stepArenaItemPhysics,
+  stepWeatherState,
 } from './rules';
 import { sound } from './sound';
 import {
@@ -33,6 +39,7 @@ import {
   ArenaDefinition,
   ArenaItemKind,
   BeamEffect,
+  BlackHoleVortex,
   Fighter,
   FighterInputState,
   FloatingCallout,
@@ -44,7 +51,9 @@ import {
   Projectile,
   ScreenFlashState,
   SlashArcEffect,
+  StuckSpear,
   WeaponPickup,
+  WeatherState,
 } from './types';
 import { WEAPONS } from './weapons';
 
@@ -114,6 +123,9 @@ export class StickFightEngine {
   private pickups: WeaponPickup[] = [];
   private beams: BeamEffect[] = [];
   private slashes: SlashArcEffect[] = [];
+  private blackHoles: BlackHoleVortex[] = [];
+  private stuckSpears: StuckSpear[] = [];
+  private weather: WeatherState = createWeatherState('snowstorm', 1, 1280);
   private particleSystem = new ParticleSystem(720, 180);
   private gamepadHub = new PsGamepadHub();
   private projectiles: Projectile[] = [];
@@ -545,6 +557,15 @@ export class StickFightEngine {
     this.pickups = [];
     this.beams = [];
     this.slashes = [];
+    this.blackHoles = [];
+    this.stuckSpears = [];
+    const weatherPool: Array<WeatherState['kind']> = ['snowstorm', 'acid_rain', 'gale_wind'];
+    const initialWeather = weatherPool[(this.roundNumber - 1 + this.arenaIndex) % weatherPool.length];
+    this.weather = createWeatherState(
+      initialWeather,
+      Math.random() < 0.5 ? -1 : 1,
+      this.arena.width
+    );
     this.roundOverPending = false;
     this.roundOverTimer = 0;
     this.clearVictoryState();
@@ -609,6 +630,7 @@ export class StickFightEngine {
     if (typeof document !== 'undefined') {
       document.body.dataset.arena = this.arena.id;
       document.body.dataset.pickups = String(this.pickups.length);
+      document.body.dataset.weather = this.weather.kind;
     }
 
     if (showBanner) {
@@ -975,8 +997,11 @@ export class StickFightEngine {
       return;
     }
 
+    this.updateWeather(simDt);
     this.updatePickups(simDt);
     this.updateProjectiles(simDt);
+    this.updateBlackHoles(simDt);
+    this.updateStuckSpears(simDt);
     this.updateHazards(simDt);
     this.updateEffects(simDt);
     this.particleSystem.update(simDt, this.arena.platforms);
@@ -1420,7 +1445,15 @@ export class StickFightEngine {
       if (input.up) f.aimAngle = -Math.PI * 0.5;
     }
 
-    const accel = f.grounded ? (f.onIce ? 950 : MOVE_ACCEL_GROUND) : MOVE_ACCEL_AIR;
+    const weatherFx = computeWeatherPhysicsInfluence(
+      this.weather,
+      f.x + f.w * 0.5,
+      f.y + f.h * 0.5,
+      f.grounded,
+      this.arena.platforms
+    );
+    const effectiveIce = f.onIce || weatherFx.coldSlippery;
+    const accel = f.grounded ? (effectiveIce ? 950 : MOVE_ACCEL_GROUND) : MOVE_ACCEL_AIR;
     const maxSpd = f.blocking ? MAX_RUN_SPEED * 0.45 : MAX_RUN_SPEED;
 
     if (f.stunTimer <= 0) {
@@ -1431,9 +1464,15 @@ export class StickFightEngine {
           f.vx -= Math.sign(f.vx) * 1400 * dt;
         }
       } else {
-        const friction = f.grounded ? (f.onIce ? 260 : 2400) : 380;
+        const friction = f.grounded ? (effectiveIce ? 260 : 2400) : 380;
         if (Math.abs(f.vx) <= friction * dt) f.vx = 0;
         else f.vx -= Math.sign(f.vx) * friction * dt;
+      }
+      if (weatherFx.windAccelX !== 0) {
+        f.vx += weatherFx.windAccelX * dt;
+      }
+      if (weatherFx.speedDrag < 1 && moveDir !== 0) {
+        f.vx *= Math.pow(weatherFx.speedDrag, dt * 10);
       }
     }
 
@@ -1582,6 +1621,33 @@ export class StickFightEngine {
       }
     }
 
+    // Wall-stuck spears act as improvised ledges/footholds or can be reclaimed if unarmed
+    for (let si = this.stuckSpears.length - 1; si >= 0; si--) {
+      const sp = this.stuckSpears[si];
+      const footX = f.x + f.w * 0.5;
+      if (
+        f.vy >= 0 &&
+        f.dropThroughTimer <= 0 &&
+        prevBottom <= sp.y + 8 &&
+        f.y + f.h >= sp.y - 4 &&
+        Math.abs(footX - (sp.x - Math.cos(sp.angle) * 18)) <= 22
+      ) {
+        f.y = sp.y - 4 - f.h;
+        f.vy = 0;
+        f.grounded = true;
+      }
+      if (
+        f.weapon === 'fists' &&
+        Math.hypot(footX - sp.x, f.y + f.h * 0.5 - sp.y) < 30
+      ) {
+        f.weapon = sp.weaponId;
+        f.ammo = sp.weaponId === 'lightsaber' ? WEAPONS.lightsaber.ammo : 3;
+        this.particleSystem.emitSparks(sp.x, sp.y, sp.color, 8, 160);
+        if (this.phase === 'playing') sound.playPickup();
+        this.stuckSpears.splice(si, 1);
+      }
+    }
+
     // Distance-synced gait walk cycle + footstep dust puffs
     if (f.grounded && Math.abs(f.vx) > 20) {
       f.walkCycle += Math.abs(f.vx) * dt * 0.045;
@@ -1609,7 +1675,8 @@ export class StickFightEngine {
         this.executeAttack(f);
       }
     } else if (!f.blocking && f.stunTimer <= 0 && f.attackCooldown <= 0) {
-      const wantsAttack = f.weapon === 'smg' ? input.attackHeld : input.attackJustPressed;
+      const isRapidAuto = f.weapon === 'smg' || f.weapon === 'minigun';
+      const wantsAttack = isRapidAuto ? input.attackHeld : input.attackJustPressed;
       if (wantsAttack) {
         const spec = WEAPONS[f.weapon];
         if (spec.windup > 0) {
@@ -1635,11 +1702,12 @@ export class StickFightEngine {
     const cy = f.y + f.h * 0.34;
 
     if (spec.isMelee) {
-      if (f.weapon === 'katana') {
+      const isBlade = f.weapon === 'katana' || f.weapon === 'lightsaber';
+      if (isBlade) {
         this.spawnAfterimage(f);
-        f.vx += f.facing * 290;
+        f.vx += f.facing * (f.weapon === 'lightsaber' ? 260 : 290);
         this.spawnAfterimage(f);
-        if (this.phase === 'playing') sound.playShoot('katana');
+        if (this.phase === 'playing') sound.playShoot(f.weapon as 'katana' | 'lightsaber');
       } else {
         if (this.phase === 'playing') sound.playPunch(f.comboStep === 2);
       }
@@ -1649,25 +1717,25 @@ export class StickFightEngine {
         y: cy,
         facing: f.facing,
         angle: f.facing > 0 ? 0 : Math.PI,
-        radius: f.weapon === 'katana' ? spec.range * 0.88 : spec.range * 0.72,
+        radius: isBlade ? spec.range * 0.88 : spec.range * 0.72,
         color: spec.color,
-        life: f.weapon === 'katana' ? 0.18 : 0.14,
-        maxLife: f.weapon === 'katana' ? 0.18 : 0.14,
+        life: isBlade ? 0.18 : 0.14,
+        maxLife: isBlade ? 0.18 : 0.14,
       });
 
-      // Katana deflects incoming projectiles!
-      if (f.weapon === 'katana') {
+      // Katana & Lightsaber deflect incoming projectiles!
+      if (isBlade) {
         for (const p of this.projectiles) {
-          if (!p.active || p.ownerId === f.id || p.isRocket) continue;
+          if (!p.active || p.ownerId === f.id || p.isRocket || p.isBlackHole) continue;
           const dist = Math.hypot(p.x - (cx + f.facing * 24), p.y - cy);
-          if (dist < 64) {
+          if (dist < 68) {
             p.ownerId = f.id;
             p.vx = -p.vx * 1.15;
             p.vy = -p.vy;
-            p.color = '#E879F9';
-            this.particleSystem.emitSparks(p.x, p.y, '#E879F9', 12, 260);
-            this.spawnImpactFlash(p.x, p.y, 28, '#E879F9', 9, 'starburst');
-            this.spawnCallout(p.x, p.y - 18, 'DEFLECT!', '#F0ABFC', 1.05);
+            p.color = spec.color;
+            this.particleSystem.emitSparks(p.x, p.y, spec.color, 12, 260);
+            this.spawnImpactFlash(p.x, p.y, 28, spec.color, 9, 'starburst');
+            this.spawnCallout(p.x, p.y - 18, 'DEFLECT!', spec.color, 1.05);
             this.camera.kickX += f.facing * 6;
             if (this.phase === 'playing') sound.playParry();
           }
@@ -1774,19 +1842,41 @@ export class StickFightEngine {
         }
       }
     } else {
-      // Projectile firearm (Pistol, Shotgun, SMG, Rocket)
+      // Projectile firearm (Pistol, Shotgun, SMG, Minigun, Rocket, Snake Gun, Black Hole Gun, Spear)
       if (this.phase === 'playing') {
-        sound.playShoot(f.weapon as 'pistol' | 'shotgun' | 'smg' | 'rocket');
+        sound.playShoot(
+          f.weapon as
+            | 'pistol'
+            | 'shotgun'
+            | 'smg'
+            | 'minigun'
+            | 'rocket'
+            | 'snake_gun'
+            | 'blackhole_gun'
+            | 'spear'
+        );
       }
       const dirX = Math.cos(f.aimAngle);
       const dirY = Math.sin(f.aimAngle);
       f.vx -= dirX * spec.recoil;
+      if (f.weapon === 'minigun') {
+        f.vy -= dirY * spec.recoil * 0.42;
+      }
 
-      const power = f.weapon === 'rocket' ? 1.55 : f.weapon === 'shotgun' ? 1.45 : f.weapon === 'smg' ? 0.85 : 1;
-      if (f.weapon === 'shotgun' || f.weapon === 'rocket') {
+      const power =
+        f.weapon === 'rocket' || f.weapon === 'blackhole_gun'
+          ? 1.55
+          : f.weapon === 'shotgun'
+            ? 1.45
+            : f.weapon === 'minigun'
+              ? 1.15
+              : f.weapon === 'smg'
+                ? 0.85
+                : 1;
+      if (f.weapon === 'shotgun' || f.weapon === 'rocket' || f.weapon === 'blackhole_gun') {
         this.triggerCameraShake('collision', 0.58, -dirX, -dirY);
       } else {
-        this.camera.trauma = Math.min(1, this.camera.trauma + 0.14);
+        this.camera.trauma = Math.min(1, this.camera.trauma + (f.weapon === 'minigun' ? 0.16 : 0.14));
         this.camera.kickX -= dirX * (5.5 * power);
         this.camera.kickY -= dirY * (4 * power);
       }
@@ -1794,9 +1884,13 @@ export class StickFightEngine {
       // Directional muzzle flash cone, sparks, smoke puff, and ejected brass casing
       const muzzleX = cx + dirX * 22;
       const muzzleY = cy + dirY * 22;
-      this.particleSystem.emitMuzzleFlash(muzzleX, muzzleY, f.aimAngle, spec.color, power);
-      this.spawnImpactFlash(muzzleX, muzzleY, 18 * power, spec.color, 7, 'muzzle', f.aimAngle);
-      this.particleSystem.emitCasing(cx + dirX * 8, cy, dirX);
+      if (f.weapon !== 'spear') {
+        this.particleSystem.emitMuzzleFlash(muzzleX, muzzleY, f.aimAngle, spec.color, power);
+        this.spawnImpactFlash(muzzleX, muzzleY, 18 * power, spec.color, 7, 'muzzle', f.aimAngle);
+      }
+      if (f.weapon !== 'snake_gun' && f.weapon !== 'blackhole_gun' && f.weapon !== 'spear') {
+        this.particleSystem.emitCasing(cx + dirX * 8, cy, dirX);
+      }
 
       for (let i = 0; i < spec.pellets; i++) {
         const ang = f.aimAngle + (Math.random() * 2 - 1) * spec.spread;
@@ -1806,15 +1900,34 @@ export class StickFightEngine {
           x: cx + Math.cos(ang) * 20,
           y: cy + Math.sin(ang) * 20,
           vx: Math.cos(ang) * spec.projectileSpeed,
-          vy: Math.sin(ang) * spec.projectileSpeed,
-          radius: f.weapon === 'rocket' ? 7 : 4,
+          vy:
+            f.weapon === 'spear'
+              ? Math.sin(ang) * spec.projectileSpeed - 70
+              : f.weapon === 'snake_gun'
+                ? Math.sin(ang) * spec.projectileSpeed - 110
+                : Math.sin(ang) * spec.projectileSpeed,
+          radius:
+            f.weapon === 'rocket' || f.weapon === 'blackhole_gun'
+              ? 9
+              : f.weapon === 'snake_gun' || f.weapon === 'spear'
+                ? 8
+                : 4,
           damage: spec.damage,
           knockbackX: spec.knockbackX,
           knockbackY: spec.knockbackY,
-          life: spec.range / spec.projectileSpeed,
+          life:
+            f.weapon === 'snake_gun'
+              ? 5.5
+              : f.weapon === 'blackhole_gun'
+                ? 0.55
+                : spec.range / spec.projectileSpeed,
           color: spec.color,
           isRocket: f.weapon === 'rocket',
           explosionRadius: spec.explosionRadius ?? 0,
+          isSnake: f.weapon === 'snake_gun',
+          snakePhase: Math.random() * Math.PI * 2,
+          isBlackHole: f.weapon === 'blackhole_gun',
+          isSpear: f.weapon === 'spear',
         });
       }
     }
@@ -1835,24 +1948,26 @@ export class StickFightEngine {
     f.ammo = Infinity;
     const cx = f.x + f.w * 0.5;
     const cy = f.y + f.h * 0.34;
+    const isEmbeddable = weaponId === 'spear' || weaponId === 'lightsaber';
     this.spawnProjectile({
       ownerId: f.id,
       weaponId,
       x: cx + f.facing * 18,
       y: cy,
-      vx: f.facing * 680,
-      vy: -140,
+      vx: f.facing * (isEmbeddable ? 820 : 680),
+      vy: isEmbeddable ? -95 : -140,
       radius: 11,
-      damage: 18,
-      knockbackX: 430,
+      damage: isEmbeddable ? 28 : 18,
+      knockbackX: isEmbeddable ? 490 : 430,
       knockbackY: -240,
-      life: 1.4,
+      life: 1.5,
       color: spec.color,
       isRocket: false,
       explosionRadius: 0,
       isThrownWeapon: true,
       thrownWeaponId: weaponId,
       spinAngle: 0,
+      isSpear: isEmbeddable,
     });
     if (this.phase === 'playing') sound.playPunch(false);
   }
@@ -2142,6 +2257,9 @@ export class StickFightEngine {
       }
 
       const hadFuse = pk.fuseTimer > 0;
+      if (pk.parachuteOpen && !pk.grounded && this.weather.kind !== 'clear') {
+        pk.vx += this.weather.windDir * 95 * this.weather.intensity * dt;
+      }
       const step = stepArenaItemPhysics(pk, this.arena.platforms, this.arena.width, dt);
 
       if (step.hitBouncePad) {
@@ -2218,6 +2336,10 @@ export class StickFightEngine {
     p.isThrownWeapon = opts.isThrownWeapon;
     p.thrownWeaponId = opts.thrownWeaponId;
     p.spinAngle = opts.spinAngle ?? 0;
+    p.isSnake = opts.isSnake;
+    p.snakePhase = opts.snakePhase;
+    p.isBlackHole = opts.isBlackHole;
+    p.isSpear = opts.isSpear;
   }
 
   private updateProjectiles(dt: number): void {
@@ -2226,18 +2348,80 @@ export class StickFightEngine {
       p.life -= dt;
       if (p.life <= 0) {
         if (p.isRocket) this.detonateRocket(p);
+        else if (p.isBlackHole) this.spawnBlackHoleVortex(p.x, p.y, p.ownerId);
         p.active = false;
         continue;
       }
 
       p.prevX = p.x;
       p.prevY = p.y;
-      if (p.isThrownWeapon) {
-        p.vy += GRAVITY * 0.55 * dt;
-        p.spinAngle = (p.spinAngle ?? 0) + dt * 16;
+      if (p.isThrownWeapon || p.isSpear) {
+        p.vy += GRAVITY * (p.isSpear && !p.isThrownWeapon ? 0.24 : 0.55) * dt;
+        if (p.isThrownWeapon) p.spinAngle = (p.spinAngle ?? 0) + dt * 16;
+      } else if (p.isSnake) {
+        // Living snakes slither with gravity and actively seek the nearest enemy fighter
+        p.vy += GRAVITY * 0.72 * dt;
+        let nearest: Fighter | null = null;
+        let bestDist = Infinity;
+        for (const f of this.fighters) {
+          if (!f.alive || f.id === p.ownerId) continue;
+          const d = Math.hypot(f.x + f.w * 0.5 - p.x, f.y + f.h * 0.5 - p.y);
+          if (d < bestDist) {
+            bestDist = d;
+            nearest = f;
+          }
+        }
+        if (nearest) {
+          const steer = computeSnakeSteering(
+            p.x,
+            p.y,
+            p.vx,
+            p.vy,
+            nearest.x + nearest.w * 0.5,
+            nearest.y + nearest.h * 0.5,
+            dt
+          );
+          p.vx = steer.vx;
+          p.vy = steer.vy;
+        }
       }
+
+      // Subtle gale-wind bend on airborne non-laser projectiles
+      if (this.weather.kind === 'gale_wind') {
+        p.vx += this.weather.windDir * 140 * this.weather.intensity * dt;
+      }
+
       p.x += p.vx * dt;
       p.y += p.vy * dt;
+
+      if (p.isSnake) {
+        if (p.x < 30) {
+          p.x = 30;
+          p.vx = Math.abs(p.vx);
+        } else if (p.x > this.arena.width - 30) {
+          p.x = this.arena.width - 30;
+          p.vx = -Math.abs(p.vx);
+        }
+        if (p.y > this.arena.abyssY) {
+          p.active = false;
+          continue;
+        }
+      } else if (p.isSpear) {
+        // Spears stick into arena side walls!
+        if (p.x <= 26 || p.x >= this.arena.width - 26) {
+          const wallX = p.x <= 26 ? 26 : this.arena.width - 26;
+          this.embedSpear(
+            wallX,
+            p.y,
+            Math.atan2(p.vy, p.vx),
+            p.thrownWeaponId === 'lightsaber' ? 'lightsaber' : 'spear',
+            p.color,
+            null
+          );
+          p.active = false;
+          continue;
+        }
+      }
 
       if (p.isRocket && Math.random() < 0.85) {
         this.particleSystem.spawn({
@@ -2273,10 +2457,25 @@ export class StickFightEngine {
       // Check platform hits
       let hitPlatform = false;
       let hitDestructible = false;
+      let hitPlatId: string | null = null;
       for (const plat of this.arena.platforms) {
-        if (plat.kind === 'oneway') continue;
         if (plat.kind === 'destructible' && (plat.hp ?? 1) <= 0) continue;
+        if (p.isSnake) {
+          if (
+            p.vy >= 0 &&
+            p.prevY + p.radius <= plat.y + 14 &&
+            p.y + p.radius >= plat.y &&
+            p.x >= plat.x &&
+            p.x <= plat.x + plat.w
+          ) {
+            p.y = plat.y - p.radius;
+            p.vy = -245;
+          }
+          continue;
+        }
+        if (plat.kind === 'oneway') continue;
         if (p.x >= plat.x && p.x <= plat.x + plat.w && p.y >= plat.y && p.y <= plat.y + plat.h) {
+          hitPlatId = plat.id;
           if (plat.kind === 'destructible') {
             hitDestructible = true;
             plat.hp = (plat.hp ?? 35) - p.damage;
@@ -2295,6 +2494,17 @@ export class StickFightEngine {
       if (hitPlatform) {
         if (p.isRocket) {
           this.detonateRocket(p);
+        } else if (p.isBlackHole) {
+          this.spawnBlackHoleVortex(p.x, p.y, p.ownerId);
+        } else if (p.isSpear && !hitDestructible) {
+          this.embedSpear(
+            p.x,
+            p.y,
+            Math.atan2(p.vy, p.vx),
+            p.thrownWeaponId === 'lightsaber' ? 'lightsaber' : 'spear',
+            p.color,
+            hitPlatId
+          );
         } else {
           this.particleSystem.emitSparks(p.x, p.y, p.color, 6, 190);
           if (!hitDestructible) {
@@ -2305,7 +2515,7 @@ export class StickFightEngine {
         continue;
       }
 
-      // Check projectile hits against explosive crates & dropped weapons
+      // Check projectile hits against explosive crates
       let hitItem = false;
       for (let i = this.pickups.length - 1; i >= 0; i--) {
         const pk = this.pickups[i];
@@ -2313,6 +2523,8 @@ export class StickFightEngine {
         if (Math.hypot(p.x - pk.x, p.y - pk.y) <= p.radius + pk.radius + 3) {
           if (p.isRocket) {
             this.detonateRocket(p);
+          } else if (p.isBlackHole) {
+            this.spawnBlackHoleVortex(p.x, p.y, p.ownerId);
           } else {
             pk.vx += (p.vx >= 0 ? 1 : -1) * 240;
             pk.vy = Math.min(pk.vy, -140);
@@ -2345,6 +2557,8 @@ export class StickFightEngine {
         ) {
           if (p.isRocket) {
             this.detonateRocket(p);
+          } else if (p.isBlackHole) {
+            this.spawnBlackHoleVortex(p.x, p.y, p.ownerId);
           } else {
             const attacker = this.fighters.find((a) => a.id === p.ownerId) ?? null;
             this.applyHitToFighter(
@@ -2355,9 +2569,202 @@ export class StickFightEngine {
               p.knockbackY,
               p.vx >= 0 ? 1 : -1
             );
+            if (p.isSnake) {
+              this.spawnCallout(p.x, p.y - 18, 'HISS!', '#4ADE80', 0.95);
+            } else if (p.isSpear) {
+              this.spawnCallout(p.x, p.y - 18, 'IMPALED!', '#E2E8F0', 1.0);
+            }
           }
           p.active = false;
           break;
+        }
+      }
+    }
+  }
+
+  private embedSpear(
+    x: number,
+    y: number,
+    angle: number,
+    weaponId: 'spear' | 'lightsaber',
+    color: string,
+    platformId: string | null
+  ): void {
+    this.stuckSpears.push({
+      id: this.nextEntityId++,
+      weaponId,
+      x,
+      y,
+      angle,
+      color,
+      platformId,
+      life: 9,
+      maxLife: 9,
+    });
+    if (this.stuckSpears.length > 16) {
+      this.stuckSpears.shift();
+    }
+    this.particleSystem.emitSparks(x, y, color, 8, 200);
+    this.triggerCameraShake('collision', 0.25, Math.cos(angle), Math.sin(angle));
+    if (this.phase === 'playing') sound.playSpearStick();
+  }
+
+  private updateStuckSpears(dt: number): void {
+    for (let i = this.stuckSpears.length - 1; i >= 0; i--) {
+      const sp = this.stuckSpears[i];
+      sp.life -= dt;
+      if (sp.life <= 0) {
+        this.stuckSpears.splice(i, 1);
+      }
+    }
+  }
+
+  private spawnBlackHoleVortex(x: number, y: number, ownerId: number): void {
+    const cx = Math.max(90, Math.min(this.arena.width - 90, x));
+    const cy = Math.max(90, Math.min(this.arena.height - 90, y));
+    this.blackHoles.push({
+      id: this.nextEntityId++,
+      ownerId,
+      x: cx,
+      y: cy,
+      radius: 22,
+      pullRadius: 275,
+      life: 2.5,
+      maxLife: 2.5,
+      spin: 0,
+      tickTimer: 0.2,
+    });
+    this.particleSystem.emitRing(cx, cy, 70, '#A855F7', 0.34);
+    this.spawnCallout(cx, cy - 28, 'VORTEX!', '#C084FC', 1.2);
+    this.triggerCameraShake('collision', 0.65, 0, 0);
+  }
+
+  private updateBlackHoles(dt: number): void {
+    for (let i = this.blackHoles.length - 1; i >= 0; i--) {
+      const bh = this.blackHoles[i];
+      bh.life -= dt;
+      bh.spin += dt * 7.5;
+      bh.tickTimer -= dt;
+      const dealCoreTick = bh.tickTimer <= 0;
+      if (dealCoreTick) bh.tickTimer = 0.3;
+
+      const attacker = this.fighters.find((a) => a.id === bh.ownerId) ?? null;
+      for (const f of this.fighters) {
+        if (!f.alive || f.victoryPose) continue;
+        const fcX = f.x + f.w * 0.5;
+        const fcY = f.y + f.h * 0.5;
+        const pull = computeBlackHolePull(bh.x, bh.y, fcX, fcY, bh.pullRadius, 44, 1750);
+        if (pull.ax !== 0 || pull.ay !== 0) {
+          const factor = f.id === bh.ownerId ? 0.35 : 1;
+          f.vx += pull.ax * factor * dt;
+          f.vy += pull.ay * factor * dt;
+          if (pull.ay < -200) f.grounded = false;
+        }
+        if (dealCoreTick && pull.inCore && f.id !== bh.ownerId) {
+          this.applyHitToFighter(
+            attacker,
+            f,
+            6,
+            (bh.x >= fcX ? 1 : -1) * 140,
+            -120,
+            bh.x >= fcX ? 1 : -1
+          );
+        }
+      }
+
+      // Pull dropped weapons & explosive crates into the singularity!
+      for (const pk of this.pickups) {
+        const pull = computeBlackHolePull(bh.x, bh.y, pk.x, pk.y, bh.pullRadius, 36, 1500);
+        if (pull.ax !== 0 || pull.ay !== 0) {
+          pk.vx += pull.ax * dt;
+          pk.vy += pull.ay * dt;
+          pk.grounded = false;
+          pk.parachuteOpen = false;
+        }
+      }
+
+      // Bend regular bullets/spears toward vortex
+      for (const p of this.projectiles) {
+        if (!p.active || p.isBlackHole) continue;
+        const pull = computeBlackHolePull(bh.x, bh.y, p.x, p.y, bh.pullRadius * 0.85, 22, 1300);
+        if (pull.ax !== 0 || pull.ay !== 0) {
+          p.vx += pull.ax * dt;
+          p.vy += pull.ay * dt;
+        }
+      }
+
+      if (bh.life <= 0) {
+        // Collapse shockwave burst
+        this.particleSystem.emitExplosion(bh.x, bh.y, 130, '#A855F7');
+        this.particleSystem.emitRing(bh.x, bh.y, 92, '#E9D5FF', 0.38);
+        this.spawnImpactFlash(bh.x, bh.y, 70, '#C084FC', 11, 'explosion');
+        this.triggerCameraShake('explosion', 1.15, 0, -0.5);
+        if (this.phase === 'playing') sound.playBlackHoleCollapse();
+
+        for (const f of this.fighters) {
+          if (!f.alive || f.victoryPose) continue;
+          const fcX = f.x + f.w * 0.5;
+          const fcY = f.y + f.h * 0.5;
+          const d = Math.hypot(fcX - bh.x, fcY - bh.y);
+          if (d < 165) {
+            const dir: 1 | -1 = fcX >= bh.x ? 1 : -1;
+            const scale = Math.max(0.4, 1 - d / 165);
+            this.applyHitToFighter(
+              attacker,
+              f,
+              (f.id === bh.ownerId ? 8 : 22) * scale,
+              520 * scale,
+              -340 * scale,
+              dir,
+              true
+            );
+          }
+        }
+        this.blackHoles.splice(i, 1);
+      }
+    }
+  }
+
+  private updateWeather(dt: number): void {
+    const res = stepWeatherState(this.weather, this.arena.width, dt);
+    if (res.changed) {
+      if (typeof document !== 'undefined') {
+        document.body.dataset.weather = this.weather.kind;
+      }
+      if (this.phase === 'playing') {
+        const label = getWeatherLabel(this.weather.kind).toUpperCase();
+        const color =
+          this.weather.kind === 'acid_rain'
+            ? '#4ADE80'
+            : this.weather.kind === 'snowstorm'
+              ? '#7DD3FC'
+              : this.weather.kind === 'gale_wind'
+                ? '#E2E8F0'
+                : '#FDE047';
+        this.spawnCallout(this.arena.width * 0.5, 118, label, color, 1.05);
+        this.emitHud(true);
+      }
+    }
+
+    if (this.weather.kind === 'acid_rain') {
+      this.weather.acidTickTimer -= dt;
+      if (this.weather.acidTickTimer <= 0) {
+        this.weather.acidTickTimer = 0.78;
+        for (const f of this.fighters) {
+          if (!f.alive || f.victoryPose) continue;
+          const fx = f.x + f.w * 0.5;
+          const fy = f.y + f.h * 0.5;
+          const fxState = computeWeatherPhysicsInfluence(
+            this.weather,
+            fx,
+            fy,
+            f.grounded,
+            this.arena.platforms
+          );
+          if (fxState.exposedToAcid) {
+            f.hp = Math.max(1, f.hp - 2);
+            this.particleSystem.emitSparks(fx, f.y + 8, '#4ADE80', 5, 130);
+          }
         }
       }
     }
@@ -2675,7 +3082,10 @@ export class StickFightEngine {
       this.elapsedTime,
       this.victoryBloomIntensity,
       this.phase === 'gameover',
-      this.killCamVignette
+      this.killCamVignette,
+      this.weather,
+      this.blackHoles,
+      this.stuckSpears
     );
     this.ctx.restore();
   }
@@ -2684,7 +3094,9 @@ export class StickFightEngine {
     const connectedPads = this.gamepadHub.getConnectedCount();
     const signature = `${this.phase}|${this.arena.name}|${this.roundNumber}|${
       this.roundBannerText ?? ''
-    }|${sound.isMuted()}|${connectedPads}|${this.config.showVirtualPsPad ? 1 : 0}|${this.fighters
+    }|${sound.isMuted()}|${connectedPads}|${this.config.showVirtualPsPad ? 1 : 0}|${
+      this.weather.kind
+    }|${this.weather.windDir}|${this.fighters
       .map(
         (f) =>
           `${f.id}:${Math.round(f.hp)}:${Math.round(f.ghostHp)}:${f.alive ? 1 : 0}:${f.weapon}:${
@@ -2708,6 +3120,9 @@ export class StickFightEngine {
       mode: this.config.mode,
       connectedPads,
       showVirtualPsPad: this.config.showVirtualPsPad,
+      weatherKind: this.weather.kind,
+      weatherLabel: getWeatherLabel(this.weather.kind),
+      windDir: this.weather.windDir,
       fighters: this.fighters.map((f) => {
         const spec = WEAPONS[f.weapon];
         return {

@@ -5,14 +5,18 @@ import { DEFAULT_MATCH_CONFIG, resolveFighterPalette } from './cosmetics';
 import { mapGamepadToFighterInput } from './gamepad';
 import { ParticleSystem } from './particles';
 import {
+  computeBlackHolePull,
   computeCameraShakeImpulse,
   computeImpactStarMetrics,
   computeKillCamState,
   computeRagdollFlailRig,
+  computeSnakeSteering,
   computeVictoryBloomMetrics,
   computeVictoryLimbEmitters,
   computeVictoryRig,
   computeVictoryShakeResponse,
+  computeWeatherPhysicsInfluence,
+  createWeatherState,
   evaluateMatchWinner,
   evaluateRoundOutcome,
   getBotTuning,
@@ -25,8 +29,10 @@ import {
   pointToSegmentDistance,
   resolveHit,
   stepArenaItemPhysics,
+  stepWeatherState,
 } from './rules';
 import { Platform, WeaponPickup } from './types';
+import { DROP_POOL, WEAPONS } from './weapons';
 
 test('resolveHit handles standard, blocked, and parried attacks cleanly', () => {
   const unblocked = resolveHit(
@@ -483,9 +489,22 @@ test('pickRandomArenaDrop and stepArenaItemPhysics support guns, swords, explosi
   const crateDrop = pickRandomArenaDrop(() => 0.1, true);
   assert.equal(crateDrop.kind, 'explosive_crate');
 
-  const swordDrop = pickRandomArenaDrop(() => 0.62, true);
+  const katanaIdx = DROP_POOL.indexOf('katana');
+  assert.ok(katanaIdx >= 0);
+  let katanaRoll = 0;
+  const swordDrop = pickRandomArenaDrop(
+    () => (katanaRoll++ === 0 ? 0.9 : (katanaIdx + 0.1) / DROP_POOL.length),
+    true
+  );
   assert.equal(swordDrop.kind, 'weapon');
   assert.equal(swordDrop.weaponId, 'katana');
+
+  for (const id of ['minigun', 'snake_gun', 'blackhole_gun', 'lightsaber', 'spear'] as const) {
+    assert.ok(DROP_POOL.includes(id), `DROP_POOL should include ${id}`);
+    assert.ok(WEAPONS[id].ammo > 0);
+  }
+  assert.ok(WEAPONS.minigun.recoil >= 80 && WEAPONS.minigun.cooldown < 0.06);
+  assert.equal(WEAPONS.lightsaber.isMelee, true);
 
   const gunDrop = pickRandomArenaDrop(() => 0.05, false);
   assert.equal(gunDrop.kind, 'weapon');
@@ -542,6 +561,58 @@ test('pickRandomArenaDrop and stepArenaItemPhysics support guns, swords, explosi
   const padStep = stepArenaItemPhysics(padItem, [floor, pad], 1280, 0.05);
   assert.equal(padStep.hitBouncePad, true);
   assert.ok(padItem.vy < -500, 'Bounce pad launches weapon drop upward');
+});
+
+test('dynamic weather cycles periodically and applies wind, localized snow, and roof-aware acid rain physics', () => {
+  const w = createWeatherState('snowstorm', 1, 1280);
+  w.zoneCenterX = 400;
+  w.zoneHalfWidth = 220;
+  w.intensity = 1;
+
+  const roofPlat: Platform = { id: 'roof', x: 300, y: 200, w: 200, h: 20, kind: 'solid' };
+
+  // Inside snowstorm zone gets wind & chill drag; outside zone is calm
+  const inSnow = computeWeatherPhysicsInfluence(w, 400, 450, true, [roofPlat]);
+  const outSnow = computeWeatherPhysicsInfluence(w, 1050, 450, true, [roofPlat]);
+  assert.equal(inSnow.inZone, true);
+  assert.equal(inSnow.coldSlippery, true);
+  assert.ok(inSnow.windAccelX > 0);
+  assert.equal(outSnow.inZone, false);
+  assert.equal(outSnow.windAccelX, 0);
+
+  // Acid rain exposes players in open sky, but shields players under a roof platform
+  w.kind = 'acid_rain';
+  const underRoof = computeWeatherPhysicsInfluence(w, 400, 450, true, [roofPlat]);
+  const openSky = computeWeatherPhysicsInfluence(w, 560, 450, true, [roofPlat]);
+  assert.equal(underRoof.exposedToAcid, false);
+  assert.equal(openSky.exposedToAcid, true);
+
+  // Gale wind pushes airborne fighters harder than grounded fighters
+  w.kind = 'gale_wind';
+  w.windDir = -1;
+  const airGale = computeWeatherPhysicsInfluence(w, 640, 300, false, []);
+  const groundGale = computeWeatherPhysicsInfluence(w, 640, 500, true, []);
+  assert.ok(airGale.windAccelX < groundGale.windAccelX && groundGale.windAccelX < 0);
+
+  // Stepping past duration transitions to another weather kind
+  w.timer = 0.05;
+  const stepped = stepWeatherState(w, 1280, 0.1, () => 0.5);
+  assert.equal(stepped.changed, true);
+  assert.notEqual(w.kind, 'gale_wind');
+});
+
+test('black hole gravity pulls inward with swirl and snakes steer & lunge toward opponents', () => {
+  const outer = computeBlackHolePull(640, 360, 780, 360, 260, 42, 1600);
+  assert.ok(outer.ax < 0, 'Black hole pulls right-side entity leftward toward center');
+  assert.ok(Math.abs(outer.ay) > 10, 'Black hole adds tangential swirl acceleration');
+  assert.equal(outer.inCore, false);
+
+  const core = computeBlackHolePull(640, 360, 655, 360, 260, 42, 1600);
+  assert.equal(core.inCore, true);
+
+  const steer = computeSnakeSteering(300, 500, 120, 40, 520, 380, 0.05);
+  assert.ok(steer.vx > 120, 'Snake accelerates horizontally toward opponent on the right');
+  assert.ok(steer.vy < 0, 'Snake lunges upward toward elevated opponent');
 });
 
 

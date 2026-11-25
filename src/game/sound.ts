@@ -126,7 +126,20 @@ class SoundEngine {
     });
   }
 
-  public playShoot(weapon: 'pistol' | 'shotgun' | 'smg' | 'rocket' | 'laser' | 'katana'): void {
+  public playShoot(
+    weapon:
+      | 'pistol'
+      | 'shotgun'
+      | 'smg'
+      | 'minigun'
+      | 'rocket'
+      | 'laser'
+      | 'katana'
+      | 'lightsaber'
+      | 'spear'
+      | 'snake_gun'
+      | 'blackhole_gun'
+  ): void {
     const ctx = this.getCtx();
     if (!ctx) return;
     const t = ctx.currentTime;
@@ -145,22 +158,66 @@ class SoundEngine {
       return;
     }
 
-    if (weapon === 'katana') {
+    if (weapon === 'katana' || weapon === 'lightsaber') {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = weapon === 'lightsaber' ? 'sawtooth' : 'sine';
+      osc.frequency.setValueAtTime(this.pitchJitter(weapon === 'lightsaber' ? 340 : 620), t);
+      osc.frequency.exponentialRampToValueAtTime(weapon === 'lightsaber' ? 145 : 190, t + 0.13);
+      gain.gain.setValueAtTime(weapon === 'lightsaber' ? 0.13 : 0.11, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.15);
+      return;
+    }
+
+    if (weapon === 'snake_gun') {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(this.pitchJitter(520), t);
+      osc.frequency.exponentialRampToValueAtTime(940, t + 0.06);
+      osc.frequency.exponentialRampToValueAtTime(340, t + 0.14);
+      gain.gain.setValueAtTime(0.11, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.16);
+      return;
+    }
+
+    if (weapon === 'blackhole_gun') {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(this.pitchJitter(620), t);
-      osc.frequency.exponentialRampToValueAtTime(190, t + 0.11);
-      gain.gain.setValueAtTime(0.11, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+      osc.frequency.setValueAtTime(240, t);
+      osc.frequency.exponentialRampToValueAtTime(62, t + 0.28);
+      gain.gain.setValueAtTime(0.22, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
       osc.connect(gain).connect(ctx.destination);
       osc.start(t);
-      osc.stop(t + 0.13);
+      osc.stop(t + 0.31);
+      return;
+    }
+
+    if (weapon === 'spear') {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(this.pitchJitter(440), t);
+      osc.frequency.exponentialRampToValueAtTime(160, t + 0.09);
+      gain.gain.setValueAtTime(0.12, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.11);
       return;
     }
 
     // Noise burst + punchy transient for firearms
-    const duration = weapon === 'shotgun' ? 0.18 : weapon === 'rocket' ? 0.22 : 0.08;
+    const duration =
+      weapon === 'shotgun' ? 0.18 : weapon === 'rocket' ? 0.22 : weapon === 'minigun' ? 0.065 : 0.08;
     const bufSize = Math.floor(ctx.sampleRate * duration);
     const buffer = ctx.createBuffer(1, bufSize, ctx.sampleRate);
     const data = buffer.getChannelData(0);
@@ -172,10 +229,11 @@ class SoundEngine {
 
     const filter = ctx.createBiquadFilter();
     filter.type = 'bandpass';
-    filter.frequency.value = weapon === 'shotgun' ? 950 : weapon === 'rocket' ? 600 : 1800;
+    filter.frequency.value =
+      weapon === 'shotgun' ? 950 : weapon === 'rocket' ? 600 : weapon === 'minigun' ? 1450 : 1800;
 
     const gain = ctx.createGain();
-    const vol = weapon === 'shotgun' ? 0.22 : weapon === 'smg' ? 0.1 : 0.15;
+    const vol = weapon === 'shotgun' ? 0.22 : weapon === 'smg' ? 0.1 : weapon === 'minigun' ? 0.09 : 0.15;
     gain.gain.setValueAtTime(vol, t);
     gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
 
@@ -194,6 +252,39 @@ class SoundEngine {
 
     noise.connect(filter).connect(gain).connect(ctx.destination);
     noise.start(t);
+  }
+
+  public playSpearStick(): void {
+    const ctx = this.getCtx();
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(this.pitchJitter(240), t);
+    osc.frequency.exponentialRampToValueAtTime(85, t + 0.07);
+    gain.gain.setValueAtTime(0.14, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.09);
+  }
+
+  public playBlackHoleCollapse(): void {
+    const ctx = this.getCtx();
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(75, t);
+    osc.frequency.exponentialRampToValueAtTime(310, t + 0.12);
+    osc.frequency.exponentialRampToValueAtTime(38, t + 0.36);
+    gain.gain.setValueAtTime(0.24, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.4);
   }
 
   public playExplosion(): void {

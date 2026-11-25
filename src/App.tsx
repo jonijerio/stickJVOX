@@ -29,6 +29,9 @@ export default function App() {
     mode: '1p_duel',
     connectedPads: 0,
     showVirtualPsPad: config.showVirtualPsPad,
+    weatherKind: 'snowstorm',
+    weatherLabel: 'Snowstorm',
+    windDir: 1,
   });
   const [summary, setSummary] = useState<MatchSummary | null>(null);
 

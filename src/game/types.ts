@@ -17,9 +17,52 @@ export type WeaponId =
   | 'pistol'
   | 'shotgun'
   | 'smg'
+  | 'minigun'
   | 'katana'
+  | 'lightsaber'
+  | 'spear'
+  | 'snake_gun'
+  | 'blackhole_gun'
   | 'rocket'
   | 'laser';
+
+export type WeatherKind = 'clear' | 'snowstorm' | 'acid_rain' | 'gale_wind';
+
+export interface WeatherState {
+  kind: WeatherKind;
+  timer: number;
+  duration: number;
+  intensity: number;
+  windDir: -1 | 1;
+  zoneCenterX: number;
+  zoneHalfWidth: number;
+  acidTickTimer: number;
+}
+
+export interface BlackHoleVortex {
+  id: number;
+  ownerId: number;
+  x: number;
+  y: number;
+  radius: number;
+  pullRadius: number;
+  life: number;
+  maxLife: number;
+  spin: number;
+  tickTimer: number;
+}
+
+export interface StuckSpear {
+  id: number;
+  weaponId: 'spear' | 'lightsaber';
+  x: number;
+  y: number;
+  angle: number;
+  color: string;
+  platformId: string | null;
+  life: number;
+  maxLife: number;
+}
 
 export interface WeaponSpec {
   id: WeaponId;
@@ -216,6 +259,10 @@ export interface Projectile {
   isThrownWeapon?: boolean;
   thrownWeaponId?: WeaponId;
   spinAngle?: number;
+  isSnake?: boolean;
+  snakePhase?: number;
+  isBlackHole?: boolean;
+  isSpear?: boolean;
 }
 
 export type ArenaItemKind = 'weapon' | 'explosive_crate';
@@ -404,6 +451,9 @@ export interface HudSnapshot {
   mode: PlayMode;
   connectedPads: number;
   showVirtualPsPad: boolean;
+  weatherKind: WeatherKind;
+  weatherLabel: string;
+  windDir: -1 | 1;
 }
 
 export interface MatchSummary {

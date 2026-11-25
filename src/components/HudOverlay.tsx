@@ -73,6 +73,46 @@ function WeaponIconSvg({ weapon, color }: { weapon: WeaponId; color: string }) {
           strokeLinecap="round"
         />
       )}
+      {weapon === 'minigun' && (
+        <path
+          d="M2 9h8v6H2V9zm8 1h11m-11 2h12m-12 2h11"
+          fill={color}
+          stroke={color}
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        />
+      )}
+      {weapon === 'lightsaber' && (
+        <path
+          d="M4 20l4-4M8 16L20 4"
+          stroke={color}
+          strokeWidth="2.6"
+          strokeLinecap="round"
+        />
+      )}
+      {weapon === 'spear' && (
+        <path
+          d="M3 20L17 6m-3-1l6-2-2 6"
+          stroke={color}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      )}
+      {weapon === 'snake_gun' && (
+        <path
+          d="M3 14c3-5 6 5 9-2s5-3 9-1"
+          stroke={color}
+          strokeWidth="2.4"
+          strokeLinecap="round"
+        />
+      )}
+      {weapon === 'blackhole_gun' && (
+        <g stroke={color} strokeWidth="1.8">
+          <circle cx="12" cy="12" r="4" fill="#0B0E14" />
+          <circle cx="12" cy="12" r="8" strokeDasharray="3 2" />
+        </g>
+      )}
     </svg>
   );
 }
@@ -178,6 +218,19 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
               Round {hud.roundNumber} · First to {hud.roundsToWin}
               {hud.connectedPads > 0 ? ` · PS Pad (${hud.connectedPads})` : ''}
             </span>
+            {hud.weatherKind !== 'clear' && (
+              <span
+                className={`text-[10px] font-bold uppercase tracking-widest ${
+                  hud.weatherKind === 'acid_rain'
+                    ? 'text-emerald-400'
+                    : hud.weatherKind === 'snowstorm'
+                      ? 'text-sky-300'
+                      : 'text-slate-300'
+                }`}
+              >
+                {hud.weatherLabel} {hud.windDir > 0 ? '→' : '←'}
+              </span>
+            )}
           </div>
 
           <button

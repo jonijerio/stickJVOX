@@ -10,6 +10,8 @@ import {
   VictoryPoseType,
   WeaponId,
   WeaponPickup,
+  WeatherKind,
+  WeatherState,
 } from './types';
 import { pickRandomWeapon } from './weapons';
 
@@ -898,6 +900,233 @@ export function stepArenaItemPhysics(
   }
 
   return { bounced, hitBouncePad, highSpeedImpact };
+}
+
+const ACTIVE_WEATHER_KINDS: WeatherKind[] = ['snowstorm', 'acid_rain', 'gale_wind'];
+
+export function getWeatherLabel(kind: WeatherKind): string {
+  switch (kind) {
+    case 'snowstorm':
+      return 'Snowstorm';
+    case 'acid_rain':
+      return 'Acid Rain';
+    case 'gale_wind':
+      return 'Gale Wind';
+    default:
+      return 'Clear';
+  }
+}
+
+export function createWeatherState(
+  kind: WeatherKind = 'snowstorm',
+  windDir: -1 | 1 = 1,
+  arenaWidth = 1280
+): WeatherState {
+  const duration = kind === 'clear' ? 6.5 : 11.5;
+  return {
+    kind,
+    timer: duration,
+    duration,
+    intensity: kind === 'clear' ? 0 : 0.35,
+    windDir,
+    zoneCenterX: arenaWidth * 0.5,
+    zoneHalfWidth: 285,
+    acidTickTimer: 0.75,
+  };
+}
+
+export function pickNextWeatherKind(prev: WeatherKind, rng: () => number = Math.random): WeatherKind {
+  // Always shift into an active storm after clear, or 75% straight to a different storm / 25% brief clear break
+  if (prev !== 'clear' && rng() < 0.25) {
+    return 'clear';
+  }
+  const candidates = ACTIVE_WEATHER_KINDS.filter((k) => k !== prev);
+  const idx = Math.floor(rng() * candidates.length);
+  return candidates[Math.min(idx, candidates.length - 1)];
+}
+
+export function stepWeatherState(
+  weather: WeatherState,
+  arenaWidth: number,
+  dt: number,
+  rng: () => number = Math.random
+): { changed: boolean; weather: WeatherState } {
+  let changed = false;
+  weather.timer -= dt;
+
+  // Drift localized storm zone across the arena
+  const driftSpeed = weather.kind === 'gale_wind' ? 0 : 52;
+  weather.zoneCenterX += weather.windDir * driftSpeed * dt;
+  const minX = 240;
+  const maxX = Math.max(minX + 40, arenaWidth - 240);
+  if (weather.zoneCenterX < minX) {
+    weather.zoneCenterX = minX;
+    weather.windDir = 1;
+  } else if (weather.zoneCenterX > maxX) {
+    weather.zoneCenterX = maxX;
+    weather.windDir = -1;
+  }
+
+  if (weather.timer <= 0) {
+    const nextKind = pickNextWeatherKind(weather.kind, rng);
+    const nextDir: -1 | 1 = rng() < 0.5 ? -1 : 1;
+    const nextDur = nextKind === 'clear' ? 5.5 : 10.5 + rng() * 3.5;
+    weather.kind = nextKind;
+    weather.duration = nextDur;
+    weather.timer = nextDur;
+    weather.windDir = nextDir;
+    weather.zoneCenterX =
+      nextKind === 'clear' ? arenaWidth * 0.5 : minX + rng() * (maxX - minX);
+    weather.acidTickTimer = 0.75;
+    changed = true;
+  }
+
+  // Smooth fade-in and fade-out envelope for storm intensity
+  if (weather.kind === 'clear') {
+    weather.intensity = Math.max(0, weather.intensity - dt * 1.4);
+  } else {
+    const elapsed = Math.max(0, weather.duration - weather.timer);
+    const fadeIn = Math.min(1, elapsed / 1.4);
+    const fadeOut = Math.min(1, weather.timer / 1.2);
+    weather.intensity = Math.max(0.15, Math.min(1, Math.min(fadeIn, fadeOut)));
+  }
+
+  return { changed, weather };
+}
+
+export interface WeatherPhysicsInfluence {
+  windAccelX: number;
+  speedDrag: number;
+  inZone: boolean;
+  exposedToAcid: boolean;
+  coldSlippery: boolean;
+}
+
+export function computeWeatherPhysicsInfluence(
+  weather: WeatherState,
+  x: number,
+  y: number,
+  grounded: boolean,
+  platforms: ReadonlyArray<Platform>
+): WeatherPhysicsInfluence {
+  if (weather.kind === 'clear' || weather.intensity <= 0.02) {
+    return {
+      windAccelX: 0,
+      speedDrag: 1,
+      inZone: false,
+      exposedToAcid: false,
+      coldSlippery: false,
+    };
+  }
+
+  const inZone =
+    weather.kind === 'gale_wind' ||
+    Math.abs(x - weather.zoneCenterX) <= weather.zoneHalfWidth;
+
+  if (!inZone) {
+    return {
+      windAccelX: 0,
+      speedDrag: 1,
+      inZone: false,
+      exposedToAcid: false,
+      coldSlippery: false,
+    };
+  }
+
+  if (weather.kind === 'gale_wind') {
+    return {
+      windAccelX: weather.windDir * (grounded ? 310 : 560) * weather.intensity,
+      speedDrag: 1,
+      inZone: true,
+      exposedToAcid: false,
+      coldSlippery: false,
+    };
+  }
+
+  if (weather.kind === 'snowstorm') {
+    return {
+      windAccelX: weather.windDir * (grounded ? 165 : 290) * weather.intensity,
+      speedDrag: grounded ? 0.91 : 0.96,
+      inZone: true,
+      exposedToAcid: false,
+      coldSlippery: grounded,
+    };
+  }
+
+  // 'acid_rain': check whether a solid/ice/destructible platform shields the fighter from above
+  const hasRoof = platforms.some(
+    (p) =>
+      !(p.kind === 'destructible' && (p.hp ?? 1) <= 0) &&
+      x >= p.x &&
+      x <= p.x + p.w &&
+      p.y + p.h < y
+  );
+
+  return {
+    windAccelX: weather.windDir * (hasRoof ? 40 : 125) * weather.intensity,
+    speedDrag: !hasRoof && grounded ? 0.95 : 1,
+    inZone: true,
+    exposedToAcid: !hasRoof,
+    coldSlippery: false,
+  };
+}
+
+export interface BlackHolePullSample {
+  ax: number;
+  ay: number;
+  dist: number;
+  inCore: boolean;
+}
+
+export function computeBlackHolePull(
+  vortexX: number,
+  vortexY: number,
+  entityX: number,
+  entityY: number,
+  pullRadius: number,
+  coreRadius = 42,
+  strength = 1650
+): BlackHolePullSample {
+  const dx = vortexX - entityX;
+  const dy = vortexY - entityY;
+  const dist = Math.hypot(dx, dy);
+  if (dist > pullRadius || dist < 0.001) {
+    return { ax: 0, ay: 0, dist, inCore: dist <= coreRadius };
+  }
+  const nx = dx / dist;
+  const ny = dy / dist;
+  // Falloff stronger closer to center + tangential orbital swirl
+  const falloff = Math.max(0.22, 1 - dist / pullRadius);
+  const pull = strength * (0.45 + falloff * 0.95);
+  const swirl = strength * 0.36 * falloff;
+  return {
+    ax: nx * pull - ny * swirl,
+    ay: ny * pull + nx * swirl,
+    dist,
+    inCore: dist <= coreRadius,
+  };
+}
+
+export function computeSnakeSteering(
+  snakeX: number,
+  snakeY: number,
+  snakeVx: number,
+  snakeVy: number,
+  targetX: number,
+  targetY: number,
+  dt: number
+): { vx: number; vy: number } {
+  const dx = targetX - snakeX;
+  const dy = targetY - snakeY;
+  const desiredDir = dx >= 0 ? 1 : -1;
+  const chaseSpeed = 355;
+  const nextVx = snakeVx + (desiredDir * chaseSpeed - snakeVx) * Math.min(1, dt * 6.5);
+  let nextVy = snakeVy;
+  // Lunge upward if opponent is higher and snake isn't already soaring
+  if (dy < -36 && Math.abs(dx) < 280 && snakeVy > -60 && snakeVy < 210) {
+    nextVy = -390;
+  }
+  return { vx: nextVx, vy: nextVy };
 }
 
 
