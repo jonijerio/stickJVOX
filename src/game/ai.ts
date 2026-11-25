@@ -107,11 +107,12 @@ export function computeBotInput(
     return false;
   };
 
-  // Find desirable pickup if unarmed or using fists
+  // Find desirable weapon pickup if unarmed or using fists
   let desiredPickup: WeaponPickup | null = null;
   if (bot.weapon === 'fists' && pickups.length > 0) {
     let bestPickScore = Infinity;
     for (const pk of pickups) {
+      if (pk.kind !== 'weapon') continue;
       if (!pk.grounded && pk.y < 140) continue;
       if (!hasGroundAt(pk.x, pk.y)) continue;
       const d = Math.hypot(pk.x - botCx, pk.y - botCy);

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { ARENAS } from '../game/arenas';
 import { COLOR_SWATCHES, PATTERN_OPTIONS } from '../game/cosmetics';
 import { getModeRoster } from '../game/rules';
 import { AiDifficulty, CosmeticPattern, MatchConfig, PlayMode } from '../game/types';
@@ -194,7 +195,25 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                 <span className="text-slate-400 font-medium">Shared 1v1</span>
               )}
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-1 text-slate-400 font-medium">
+                  <span>Arena</span>
+                  <select
+                    aria-label="Starting Arena"
+                    value={config.startingArenaId}
+                    onChange={(e) => onChangeConfig({ ...config, startingArenaId: e.target.value })}
+                    className="bg-[#0B0E15] border border-slate-700 text-slate-200 rounded-md px-2 py-1 text-[11px] font-semibold cursor-pointer focus:outline-none focus:border-amber-400"
+                  >
+                    <option value="auto">Cycle All ({ARENAS.length})</option>
+                    <option value="random">Random ({ARENAS.length})</option>
+                    {ARENAS.map((arena, idx) => (
+                      <option key={arena.id} value={arena.id}>
+                        {idx + 1}. {arena.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
                 <div className="flex items-center gap-1">
                   <span className="text-slate-400 font-medium">First to</span>
                   <div className="flex items-center gap-1 bg-[#0B0E15] p-0.5 rounded-md border border-slate-800">

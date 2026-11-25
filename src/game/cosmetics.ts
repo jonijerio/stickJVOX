@@ -97,6 +97,7 @@ export const DEFAULT_MATCH_CONFIG: MatchConfig = {
   roundsToWin: 3,
   bloodStyle: 'crimson',
   showVirtualPsPad: false,
+  startingArenaId: 'auto',
   fighterStyles: DEFAULT_FIGHTER_STYLES.map((s) => ({ ...s })),
 };
 
@@ -157,6 +158,10 @@ export function loadSavedMatchConfig(): MatchConfig {
       roundsToWin: parsed.roundsToWin === 5 ? 5 : 3,
       bloodStyle: parsed.bloodStyle === 'fighter_ink' ? 'fighter_ink' : 'crimson',
       showVirtualPsPad: Boolean(parsed.showVirtualPsPad),
+      startingArenaId:
+        typeof parsed.startingArenaId === 'string' && parsed.startingArenaId.length > 0
+          ? parsed.startingArenaId
+          : 'auto',
       fighterStyles: styles,
     };
   } catch {

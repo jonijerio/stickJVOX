@@ -10,30 +10,43 @@ import { mergeFighterInputs, PsGamepadHub, VirtualPsPadState } from './gamepad';
 import { ParticleSystem } from './particles';
 import { CameraState, renderFrame } from './renderer';
 import {
+  CameraShakeEventKind,
+  computeCameraShakeImpulse,
+  computeKillCamState,
+  computeVictoryLimbEmitters,
+  computeVictoryShakeResponse,
   evaluateMatchWinner,
   evaluateRoundOutcome,
   getLaserPhase,
   getModeRoster,
   getPendulumPosition,
   intersectsPlatform,
+  pickRandomArenaDrop,
+  pickRandomVictoryPose,
   pointToSegmentDistance,
   resolveHit,
+  stepArenaItemPhysics,
 } from './rules';
 import { sound } from './sound';
 import {
+  AfterimageGhost,
   ArenaDefinition,
+  ArenaItemKind,
   BeamEffect,
   Fighter,
   FighterInputState,
+  FloatingCallout,
   GamePhase,
   HudSnapshot,
+  ImpactFlashEffect,
   MatchConfig,
   MatchSummary,
   Projectile,
+  ScreenFlashState,
   SlashArcEffect,
   WeaponPickup,
 } from './types';
-import { pickRandomWeapon, WEAPONS } from './weapons';
+import { WEAPONS } from './weapons';
 
 const GRAVITY = 1780;
 const MOVE_ACCEL_GROUND = 2900;
@@ -73,6 +86,17 @@ export class StickFightEngine {
   private roundNumber = 1;
   private roundOverTimer = 0;
   private roundOverPending = false;
+  private victorySequenceActive = false;
+  private victoryWinnerId: number | null = null;
+  private victorySequenceTimer = 0;
+  private confettiShowerTimer = 0;
+  private ribbonShowerTimer = 0;
+  private victoryBloomIntensity = 0;
+  private killCamActive = false;
+  private killCamWinnerId: number | null = null;
+  private killCamElapsed = 0;
+  private killCamDuration = 2.0;
+  private killCamVignette = 0;
   private roundBannerText: string | null = null;
   private roundBannerSubtext: string | null = null;
   private roundBannerTimer = 0;
@@ -90,12 +114,29 @@ export class StickFightEngine {
   private pickups: WeaponPickup[] = [];
   private beams: BeamEffect[] = [];
   private slashes: SlashArcEffect[] = [];
-  private particleSystem = new ParticleSystem(260, 140);
+  private particleSystem = new ParticleSystem(720, 180);
   private gamepadHub = new PsGamepadHub();
   private projectiles: Projectile[] = [];
   private projectileCursor = 0;
 
-  private camera: CameraState = { x: 640, y: 360, zoom: 1, trauma: 0 };
+  private impactFlashes: ImpactFlashEffect[] = [];
+  private impactFlashCursor = 0;
+  private callouts: FloatingCallout[] = [];
+  private calloutCursor = 0;
+  private afterimages: AfterimageGhost[] = [];
+  private afterimageCursor = 0;
+  private afterimageSpawnCooldown = 0;
+  private screenFlash: ScreenFlashState = { alpha: 0, color: '#FFFFFF' };
+
+  private camera: CameraState = {
+    x: 640,
+    y: 360,
+    zoom: 1,
+    trauma: 0,
+    kickX: 0,
+    kickY: 0,
+    shakeAngle: 0,
+  };
 
   private keysHeld = new Set<string>();
   private keysJustPressed = new Set<string>();
@@ -134,6 +175,49 @@ export class StickFightEngine {
       });
     }
 
+    for (let i = 0; i < 28; i++) {
+      this.impactFlashes.push({
+        active: false,
+        x: 0,
+        y: 0,
+        radius: 24,
+        color: '#FFFFFF',
+        life: 0,
+        maxLife: 0.14,
+        spikes: 8,
+        rot: 0,
+        kind: 'starburst',
+      });
+    }
+
+    for (let i = 0; i < 14; i++) {
+      this.callouts.push({
+        active: false,
+        x: 0,
+        y: 0,
+        vy: -75,
+        text: '',
+        color: '#FDE047',
+        life: 0,
+        maxLife: 0.65,
+        scale: 1,
+      });
+    }
+
+    for (let i = 0; i < 24; i++) {
+      this.afterimages.push({
+        active: false,
+        x: 0,
+        y: 0,
+        facing: 1,
+        color: '#FFFFFF',
+        life: 0,
+        maxLife: 0.18,
+        squashX: 1,
+        squashY: 1,
+      });
+    }
+
     this.setupResize();
     this.setupInputListeners();
     this.initAttractMode();
@@ -158,7 +242,7 @@ export class StickFightEngine {
       this.lastTs = now;
       const dt = Math.min(Math.max(rawDt, 0), 0.05);
 
-      if (this.phase === 'paused' || this.phase === 'gameover') {
+      if (this.phase === 'paused') {
         this.render();
         this.rafId = null;
         return;
@@ -169,7 +253,7 @@ export class StickFightEngine {
       const frameElapsed = performance.now() - frameStart;
       if (isAutomation || frameElapsed > 12) {
         setTimeout(() => {
-          if (this.loopRunning && this.phase !== 'paused' && this.phase !== 'gameover') {
+          if (this.loopRunning && this.phase !== 'paused') {
             this.rafId = requestAnimationFrame(tick);
           }
         }, isAutomation ? 120 : 16);
@@ -241,9 +325,10 @@ export class StickFightEngine {
       fighterStyles: config.fighterStyles.map((s) => ({ ...s })),
     };
     this.roundNumber = 1;
-    this.arenaIndex = 0;
+    this.arenaIndex = this.resolveStartingArenaIndex(this.config.startingArenaId);
     this.matchStartTime = 0;
     this.elapsedTime = 0;
+    this.clearVictoryState();
     this.setPhase('playing');
 
     const roster = getModeRoster(this.config);
@@ -264,8 +349,64 @@ export class StickFightEngine {
   }
 
   public returnToTitle(): void {
+    this.clearVictoryState();
     this.setPhase('title');
     this.initAttractMode();
+  }
+
+  private clearVictoryState(): void {
+    this.victorySequenceActive = false;
+    this.victoryWinnerId = null;
+    this.victorySequenceTimer = 0;
+    this.confettiShowerTimer = 0;
+    this.ribbonShowerTimer = 0;
+    this.victoryBloomIntensity = 0;
+    this.killCamActive = false;
+    this.killCamWinnerId = null;
+    this.killCamElapsed = 0;
+    this.killCamVignette = 0;
+    if (typeof document !== 'undefined') {
+      delete document.body.dataset.celebrating;
+      delete document.body.dataset.victoryPose;
+      delete document.body.dataset.victoryShake;
+      delete document.body.dataset.victoryBloom;
+      delete document.body.dataset.killCam;
+      delete document.body.dataset.timeScale;
+      delete document.body.dataset.cameraTrauma;
+    }
+  }
+
+  public triggerCameraShake(
+    kind: CameraShakeEventKind,
+    magnitude = 1,
+    dirX = 0,
+    dirY = 0
+  ): void {
+    const impulse = computeCameraShakeImpulse(kind, magnitude, dirX, dirY);
+    this.camera.trauma = Math.min(
+      1,
+      Math.max(this.camera.trauma + impulse.traumaAdd, impulse.traumaFloor)
+    );
+    this.camera.kickX += impulse.kickX;
+    this.camera.kickY += impulse.kickY;
+    this.camera.shakeAngle = Math.max(
+      -0.045,
+      Math.min(0.045, this.camera.shakeAngle + impulse.angleKick)
+    );
+
+    if (typeof document !== 'undefined') {
+      document.body.dataset.cameraTrauma = this.camera.trauma.toFixed(2);
+    }
+
+    if (this.phase === 'playing' && (kind === 'explosion' || (kind === 'destruction' && magnitude >= 0.9))) {
+      const rumbleStrength = Math.min(1, 0.45 * magnitude);
+      const rumbleMs = Math.round(Math.min(260, 110 * magnitude));
+      for (const f of this.fighters) {
+        if (!f.isBot && f.alive) {
+          this.gamepadHub.triggerRumble(f.id, rumbleStrength, rumbleMs);
+        }
+      }
+    }
   }
 
   public togglePause(): void {
@@ -305,11 +446,9 @@ export class StickFightEngine {
       }, 100);
     }
 
-    if ((prev === 'paused' || prev === 'gameover') && (next === 'playing' || next === 'title')) {
+    if (next !== 'paused' && this.rafId === null && (prev === 'paused' || prev === 'gameover')) {
       this.lastTs = performance.now();
-      if (this.rafId === null) {
-        this.scheduleNextFrame();
-      }
+      this.scheduleNextFrame();
     }
   }
 
@@ -390,6 +529,8 @@ export class StickFightEngine {
       wins: 0,
       ragdollSpin: 0,
       ragdollAngle: 0,
+      victoryPose: null,
+      victoryTimer: 0,
       aiThinkTimer: 0,
       aiTargetId: null,
       aiJumpTimer: 0,
@@ -406,12 +547,26 @@ export class StickFightEngine {
     this.slashes = [];
     this.roundOverPending = false;
     this.roundOverTimer = 0;
+    this.clearVictoryState();
     this.timeScale = 1;
     this.hitstopTimer = 0;
     this.dropSpawnTimer = 1.6;
-    this.camera = { x: this.arena.width * 0.5, y: this.arena.height * 0.5, zoom: 1, trauma: 0 };
+    this.camera = {
+      x: this.arena.width * 0.5,
+      y: this.arena.height * 0.5,
+      zoom: 1,
+      trauma: 0,
+      kickX: 0,
+      kickY: 0,
+      shakeAngle: 0,
+    };
+    this.screenFlash.alpha = 0;
+    this.afterimageSpawnCooldown = 0;
 
     for (const p of this.projectiles) p.active = false;
+    for (const f of this.impactFlashes) f.active = false;
+    for (const c of this.callouts) c.active = false;
+    for (const g of this.afterimages) g.active = false;
     this.particleSystem.clearAll();
 
     this.fighters.forEach((f, idx) => {
@@ -441,10 +596,20 @@ export class StickFightEngine {
       f.squashX = 1;
       f.squashY = 1;
       f.ragdollAngle = 0;
+      f.victoryPose = null;
+      f.victoryTimer = 0;
     });
 
-    // Spawn 1 initial center weapon drop to invite immediate scrambles
-    this.spawnWeaponDrop(this.arena.weaponDrops[0].x, 95);
+    // Spawn 2 initial aerial drops: guaranteed weapon + bonus random gun/sword/explosive crate
+    const primarySpot = this.arena.weaponDrops[0];
+    const secondarySpot = this.arena.weaponDrops[1 % this.arena.weaponDrops.length];
+    this.spawnWeaponDrop(primarySpot.x, 95, 'weapon');
+    this.spawnWeaponDrop(secondarySpot.x + (Math.random() * 48 - 24), 60);
+
+    if (typeof document !== 'undefined') {
+      document.body.dataset.arena = this.arena.id;
+      document.body.dataset.pickups = String(this.pickups.length);
+    }
 
     if (showBanner) {
       this.roundBannerText = `ROUND ${this.roundNumber}`;
@@ -452,6 +617,28 @@ export class StickFightEngine {
       this.roundBannerTimer = 1.6;
     }
     this.emitHud();
+  }
+
+  private resolveStartingArenaIndex(startingArenaId: string): number {
+    if (startingArenaId === 'random') {
+      return Math.floor(Math.random() * ARENAS.length);
+    }
+    if (startingArenaId && startingArenaId !== 'auto') {
+      const idx = ARENAS.findIndex((a) => a.id === startingArenaId);
+      if (idx >= 0) return idx;
+    }
+    return 0;
+  }
+
+  private pickNextArenaIndex(): number {
+    if (this.config.startingArenaId === 'random' && ARENAS.length > 1) {
+      let next = Math.floor(Math.random() * ARENAS.length);
+      if (next === this.arenaIndex) {
+        next = (next + 1) % ARENAS.length;
+      }
+      return next;
+    }
+    return (this.arenaIndex + 1) % ARENAS.length;
   }
 
   private setupResize(): void {
@@ -605,7 +792,27 @@ export class StickFightEngine {
   }
 
   private update(dt: number): void {
-    if (this.phase === 'paused' || this.phase === 'gameover') {
+    if (this.phase === 'paused') {
+      this.keysJustPressed.clear();
+      this.keysJustReleased.clear();
+      return;
+    }
+
+    if (this.phase === 'gameover') {
+      this.camera.trauma = Math.max(0, this.camera.trauma - dt * 2.1);
+      this.screenFlash.alpha = Math.max(0, this.screenFlash.alpha - dt * 3.8);
+      const kickDamp = Math.pow(0.001, dt);
+      this.camera.kickX *= kickDamp;
+      this.camera.kickY *= kickDamp;
+      this.camera.shakeAngle *= kickDamp;
+      if (typeof document !== 'undefined') {
+        document.body.dataset.cameraTrauma = this.camera.trauma.toFixed(2);
+      }
+      this.elapsedTime += dt;
+      this.updateVictorySequence(dt, 0.7);
+      this.updateEffects(dt);
+      this.particleSystem.update(dt, this.arena.platforms);
+      this.updateCamera(dt);
       this.keysJustPressed.clear();
       this.keysJustReleased.clear();
       return;
@@ -613,6 +820,18 @@ export class StickFightEngine {
 
     // Visual-only timers always advance in real dt
     this.camera.trauma = Math.max(0, this.camera.trauma - dt * 2.1);
+    this.screenFlash.alpha = Math.max(0, this.screenFlash.alpha - dt * 3.8);
+    const kickDamp = Math.pow(0.001, dt);
+    this.camera.kickX *= kickDamp;
+    this.camera.kickY *= kickDamp;
+    this.camera.shakeAngle *= kickDamp;
+    if (typeof document !== 'undefined') {
+      document.body.dataset.cameraTrauma = this.camera.trauma.toFixed(2);
+    }
+    if (this.afterimageSpawnCooldown > 0) {
+      this.afterimageSpawnCooldown = Math.max(0, this.afterimageSpawnCooldown - dt);
+    }
+
     if (this.roundBannerTimer > 0) {
       this.roundBannerTimer = Math.max(0, this.roundBannerTimer - dt);
       if (this.roundBannerTimer === 0) {
@@ -632,16 +851,19 @@ export class StickFightEngine {
 
     const simDt = dt * this.timeScale;
     this.elapsedTime += simDt;
-    if (this.phase === 'playing') {
+    if (this.phase === 'playing' && !this.victorySequenceActive) {
       this.matchStartTime += dt;
     }
 
-    // Weapon parachute drop timer
-    this.dropSpawnTimer -= simDt;
-    if (this.dropSpawnTimer <= 0 && this.pickups.length < 3) {
-      const spot = this.arena.weaponDrops[Math.floor(Math.random() * this.arena.weaponDrops.length)];
-      this.spawnWeaponDrop(spot.x + (Math.random() * 60 - 30), -20);
-      this.dropSpawnTimer = 5.5 + Math.random() * 2.5;
+    // Physics-enabled aerial item spawner (guns, swords, and explosive crates)
+    if (!this.victorySequenceActive) {
+      this.dropSpawnTimer -= simDt;
+      if (this.dropSpawnTimer <= 0 && this.pickups.length < 4) {
+        const spot =
+          this.arena.weaponDrops[Math.floor(Math.random() * this.arena.weaponDrops.length)];
+        this.spawnWeaponDrop(spot.x + (Math.random() * 84 - 42), -16);
+        this.dropSpawnTimer = 3.8 + Math.random() * 2.2;
+      }
     }
 
     // Update fighters (with keyboard + PS Gamepad / Virtual PS Pad merging)
@@ -650,9 +872,67 @@ export class StickFightEngine {
       if (!f.alive) {
         f.koTimer = Math.max(0, f.koTimer - simDt);
         f.vy += GRAVITY * simDt;
+        const prevBottom = f.y + f.h;
         f.x += f.vx * simDt;
         f.y += f.vy * simDt;
         f.ragdollAngle += f.ragdollSpin * simDt;
+
+        // Bounce tumbling KO ragdoll off solid platforms & arena walls
+        if (f.x < 24) {
+          f.x = 24;
+          f.vx = Math.abs(f.vx) * 0.45;
+          f.ragdollSpin = -f.ragdollSpin * 0.7;
+        } else if (f.x + f.w > this.arena.width - 24) {
+          f.x = this.arena.width - 24 - f.w;
+          f.vx = -Math.abs(f.vx) * 0.45;
+          f.ragdollSpin = -f.ragdollSpin * 0.7;
+        }
+        for (const plat of this.arena.platforms) {
+          if (plat.kind === 'destructible' && (plat.hp ?? 1) <= 0) continue;
+          if (!intersectsPlatform(f.x, f.y, f.w, f.h, plat)) continue;
+          if (plat.kind === 'oneway' && (f.vy < 0 || prevBottom > plat.y + 14)) continue;
+          if (f.vy >= 0 && prevBottom <= plat.y + 22) {
+            f.y = plat.y - f.h;
+            if (Math.abs(f.vy) > 160) {
+              f.vy = -Math.abs(f.vy) * 0.45;
+              f.vx *= 0.78;
+              f.ragdollSpin *= 0.75;
+              this.particleSystem.emitDust(f.x + f.w * 0.5, plat.y, 4, 120, '#CBD5E1');
+            } else {
+              f.vy = 0;
+              f.vx *= 0.88;
+              f.ragdollSpin *= 0.85;
+            }
+          }
+        }
+
+        // Blood & speed trails on airborne ragdolls
+        const ragSpeed = Math.hypot(f.vx, f.vy);
+        if (f.koTimer > 0 && ragSpeed > 220 && Math.random() < 0.55) {
+          this.particleSystem.spawn({
+            category: 'blood',
+            x: f.x + f.w * 0.5,
+            y: f.y + f.h * 0.45,
+            vx: -f.vx * 0.12 + (Math.random() * 40 - 20),
+            vy: -f.vy * 0.12 - 20,
+            size: 3 + Math.random() * 2.5,
+            color: this.getBloodColor(f),
+            maxLife: 0.45,
+            gravity: 960,
+            drag: 0.4,
+            shape: 'droplet',
+            alpha: 0.9,
+            paintDecalOnHit: true,
+          });
+        }
+        if (f.koTimer > 0 && ragSpeed > 420 && this.afterimageSpawnCooldown <= 0) {
+          this.spawnAfterimage(f);
+        }
+        continue;
+      }
+
+      if (this.victorySequenceActive && f.id === this.victoryWinnerId && f.victoryPose) {
+        this.updateVictoryFighter(f, simDt);
         continue;
       }
 
@@ -675,7 +955,7 @@ export class StickFightEngine {
           f.id,
           f.id === 0 && this.config.showVirtualPsPad
         );
-        if (padPoll.optionsJustPressed && this.phase === 'playing') {
+        if (padPoll.optionsJustPressed && this.phase === 'playing' && !this.victorySequenceActive) {
           padPaused = true;
           break;
         }
@@ -683,6 +963,9 @@ export class StickFightEngine {
       }
 
       this.updateFighter(f, input, simDt);
+      if (Math.hypot(f.vx, f.vy) > 480 && this.afterimageSpawnCooldown <= 0) {
+        this.spawnAfterimage(f);
+      }
     }
 
     if (padPaused) {
@@ -697,10 +980,40 @@ export class StickFightEngine {
     this.updateHazards(simDt);
     this.updateEffects(simDt);
     this.particleSystem.update(simDt, this.arena.platforms);
+    if (this.victorySequenceActive) {
+      this.updateVictorySequence(dt, 0.44);
+    }
     this.updateCamera(dt);
 
-    // Evaluate round end
-    if (!this.roundOverPending) {
+    // Evaluate round & match victory transitions
+    if (this.victorySequenceActive) {
+      this.victorySequenceTimer -= dt;
+      if (this.victorySequenceTimer <= 0) {
+        const winner = this.fighters.find((f) => f.id === this.victoryWinnerId) ?? this.fighters[0];
+        this.victorySequenceActive = false;
+        this.setPhase('gameover');
+        this.callbacks.onMatchEnd({
+          winnerId: winner.id,
+          winnerName: winner.name,
+          winnerColor: winner.palette.primary,
+          isHumanWin: !winner.isBot,
+          roundsPlayed: this.roundNumber,
+          roundsToWin: this.config.roundsToWin,
+          durationSeconds: Math.round(this.matchStartTime),
+          victoryPose: winner.victoryPose ?? undefined,
+          playerStats: this.fighters.map((f) => ({
+            id: f.id,
+            name: f.name,
+            color: f.palette.primary,
+            pattern: f.palette.pattern,
+            isBot: f.isBot,
+            wins: f.wins,
+            kills: f.kills,
+            damageDealt: Math.round(f.damageDealt),
+          })),
+        });
+      }
+    } else if (!this.roundOverPending) {
       const outcome = evaluateRoundOutcome(this.fighters);
       if (outcome.roundOver) {
         this.roundOverPending = true;
@@ -712,9 +1025,25 @@ export class StickFightEngine {
             const winFighter = this.fighters.find((f) => f.id === outcome.winnerId);
             if (winFighter) {
               winFighter.wins += 1;
+              const matchClinched = winFighter.wins >= this.config.roundsToWin;
+              if (matchClinched) {
+                this.killCamActive = true;
+                this.killCamWinnerId = winFighter.id;
+                this.killCamElapsed = 0;
+                this.killCamDuration = 2.0;
+                this.roundOverTimer = this.killCamDuration;
+                winFighter.invulnTimer = Math.max(winFighter.invulnTimer, this.killCamDuration + 0.5);
+                const kc = computeKillCamState(0, this.killCamDuration);
+                this.timeScale = kc.timeScale;
+                this.killCamVignette = kc.vignetteAlpha;
+                if (typeof document !== 'undefined') {
+                  document.body.dataset.killCam = '1';
+                  document.body.dataset.timeScale = kc.timeScale.toFixed(2);
+                }
+              }
               this.roundBannerText = `${winFighter.name.toUpperCase()} WINS`;
-              this.roundBannerSubtext = 'Round Clear';
-              this.roundBannerTimer = 1.5;
+              this.roundBannerSubtext = matchClinched ? 'Final KO · Slow-Mo Kill-Cam' : 'Round Clear';
+              this.roundBannerTimer = matchClinched ? 2.0 : 1.5;
             }
           } else {
             this.roundBannerText = 'DOUBLE KO';
@@ -725,6 +1054,15 @@ export class StickFightEngine {
         }
       }
     } else {
+      if (this.killCamActive) {
+        this.killCamElapsed = Math.min(this.killCamDuration, this.killCamElapsed + dt);
+        const kc = computeKillCamState(this.killCamElapsed, this.killCamDuration);
+        this.timeScale = kc.timeScale;
+        this.killCamVignette = kc.vignetteAlpha;
+        if (typeof document !== 'undefined') {
+          document.body.dataset.timeScale = kc.timeScale.toFixed(2);
+        }
+      }
       this.roundOverTimer -= dt;
       if (this.roundOverTimer <= 0) {
         if (this.phase === 'title') {
@@ -734,30 +1072,10 @@ export class StickFightEngine {
           const matchWinnerId = evaluateMatchWinner(this.fighters, this.config.roundsToWin);
           if (matchWinnerId !== null) {
             const winner = this.fighters.find((f) => f.id === matchWinnerId)!;
-            sound.playVictory();
-            this.setPhase('gameover');
-            this.callbacks.onMatchEnd({
-              winnerId: winner.id,
-              winnerName: winner.name,
-              winnerColor: winner.palette.primary,
-              isHumanWin: !winner.isBot,
-              roundsPlayed: this.roundNumber,
-              roundsToWin: this.config.roundsToWin,
-              durationSeconds: Math.round(this.matchStartTime),
-              playerStats: this.fighters.map((f) => ({
-                id: f.id,
-                name: f.name,
-                color: f.palette.primary,
-                pattern: f.palette.pattern,
-                isBot: f.isBot,
-                wins: f.wins,
-                kills: f.kills,
-                damageDealt: Math.round(f.damageDealt),
-              })),
-            });
+            this.startVictorySequence(winner);
           } else {
             this.roundNumber += 1;
-            this.arenaIndex = (this.arenaIndex + 1) % ARENAS.length;
+            this.arenaIndex = this.pickNextArenaIndex();
             this.setupRound(true);
           }
         }
@@ -774,6 +1092,277 @@ export class StickFightEngine {
 
     this.keysJustPressed.clear();
     this.keysJustReleased.clear();
+  }
+
+  private startVictorySequence(winner: Fighter): void {
+    const pose = pickRandomVictoryPose();
+    this.roundOverPending = false;
+    this.killCamActive = false;
+    this.killCamWinnerId = null;
+    this.killCamElapsed = 0;
+    this.killCamVignette = 0;
+    this.victorySequenceActive = true;
+    this.victoryWinnerId = winner.id;
+    this.victorySequenceTimer = 2.1;
+    this.confettiShowerTimer = 0.42;
+    this.ribbonShowerTimer = 0.55;
+    this.victoryBloomIntensity = 1;
+    this.timeScale = 1;
+    if (typeof document !== 'undefined') {
+      delete document.body.dataset.killCam;
+      delete document.body.dataset.timeScale;
+    }
+
+    winner.alive = true;
+    winner.hp = Math.max(10, winner.hp);
+    winner.invulnTimer = 999;
+    winner.stunTimer = 0;
+    winner.hitFlashTimer = 0;
+    winner.blocking = false;
+    winner.attackPending = false;
+    winner.attackActiveTimer = 0;
+    winner.weapon = 'fists';
+    winner.ammo = Infinity;
+    winner.vx *= 0.25;
+    winner.victoryPose = pose;
+    winner.victoryTimer = 0;
+
+    // Ensure winner stays clearly visible on stage if KO happened near a ledge
+    if (winner.y > this.arena.height * 0.72) {
+      const safeSpawn = this.arena.spawns[0];
+      winner.x = safeSpawn.x - winner.w * 0.5;
+      winner.y = safeSpawn.y - winner.h - 12;
+      winner.vx = 0;
+      winner.vy = 0;
+    }
+
+    if (typeof document !== 'undefined') {
+      document.body.dataset.celebrating = '1';
+      document.body.dataset.victoryPose = pose;
+      document.body.dataset.victoryShake = '1.00';
+      document.body.dataset.victoryBloom = '1.00';
+    }
+
+    const winCenterX = winner.x + winner.w * 0.5;
+    const winCenterY = winner.y + winner.h * 0.5;
+    const limbEmitters = computeVictoryLimbEmitters(
+      winCenterX,
+      winner.y + winner.h,
+      pose,
+      0,
+      winner.facing,
+      winner.grounded,
+      winner.squashX,
+      winner.squashY
+    );
+    this.particleSystem.emitLimbExplosiveConfetti(limbEmitters, winner.palette.primary, 11);
+    this.particleSystem.emitOversizedRibbons(winCenterX, winner.y, winner.palette.primary, 12);
+    this.particleSystem.emitVictoryCelebration(
+      winCenterX,
+      winner.y + 6,
+      winner.palette.primary,
+      1.35
+    );
+    this.particleSystem.emitRing(winCenterX, winCenterY, 56, winner.palette.primary, 0.36);
+    this.spawnImpactFlash(winCenterX, winCenterY, 44, '#FDE047', 10, 'starburst');
+    this.spawnCallout(winCenterX, winner.y - 46, 'CHAMPION!', '#FDE047', 1.3);
+    this.screenFlash = { alpha: 0.2, color: '#FEF08A' };
+    this.camera.trauma = Math.min(1, this.camera.trauma + 0.65);
+    this.camera.kickY -= 12;
+    sound.playVictory();
+    sound.playFirework();
+    if (!winner.isBot) {
+      this.gamepadHub.triggerRumble(winner.id, 0.7, 220);
+    }
+
+    this.roundBannerText = `${winner.name.toUpperCase()} WINS`;
+    this.roundBannerSubtext =
+      pose === 'wave' ? 'Victory Wave' : pose === 'jump' ? 'Victory Leap' : 'Champion Flex';
+    this.roundBannerTimer = 2.2;
+    this.emitHud(true);
+  }
+
+  private updateVictorySequence(dt: number, showerInterval: number): void {
+    if (this.victoryWinnerId === null) return;
+    const winner = this.fighters.find((f) => f.id === this.victoryWinnerId);
+    if (!winner) return;
+
+    if (this.phase === 'gameover') {
+      this.updateVictoryFighter(winner, dt);
+    }
+
+    this.confettiShowerTimer -= dt;
+    if (this.confettiShowerTimer <= 0) {
+      this.confettiShowerTimer = showerInterval;
+      const winCenterX = winner.x + winner.w * 0.5;
+      const limbEmitters = computeVictoryLimbEmitters(
+        winCenterX,
+        winner.y + winner.h,
+        winner.victoryPose ?? 'wave',
+        winner.victoryTimer,
+        winner.facing,
+        winner.grounded,
+        winner.squashX,
+        winner.squashY
+      );
+      this.particleSystem.emitLimbExplosiveConfetti(
+        limbEmitters,
+        winner.palette.primary,
+        this.phase === 'gameover' ? 5 : 8
+      );
+      this.particleSystem.emitVictoryCelebration(
+        winCenterX,
+        winner.y + 4,
+        winner.palette.primary,
+        this.phase === 'gameover' ? 0.75 : 1.0
+      );
+      this.camera.trauma = Math.min(
+        1,
+        this.camera.trauma + (this.phase === 'gameover' ? 0.16 : 0.28)
+      );
+      if (!sound.isMuted()) {
+        sound.playFirework();
+      }
+    }
+
+    this.ribbonShowerTimer -= dt;
+    if (this.ribbonShowerTimer <= 0) {
+      this.ribbonShowerTimer = this.phase === 'gameover' ? 0.85 : 0.6;
+      this.particleSystem.emitOversizedRibbons(
+        winner.x + winner.w * 0.5,
+        winner.y,
+        winner.palette.primary,
+        this.phase === 'gameover' ? 6 : 9
+      );
+    }
+  }
+
+  private updateVictoryFighter(f: Fighter, dt: number): void {
+    const prevTimer = f.victoryTimer;
+    f.victoryTimer += dt;
+    f.hitFlashTimer = 0;
+    f.squashX += (1 - f.squashX) * Math.min(1, dt * 14);
+    f.squashY += (1 - f.squashY) * Math.min(1, dt * 14);
+    f.vx *= Math.pow(0.05, dt);
+
+    let justJumped = false;
+    if (f.victoryPose === 'jump' && f.grounded) {
+      f.vy = -510;
+      f.vx += Math.sin(f.victoryTimer * 2.4) * 145;
+      f.grounded = false;
+      f.squashX = 0.78;
+      f.squashY = 1.26;
+      justJumped = true;
+      this.particleSystem.emitDust(f.x + f.w * 0.5, f.y + f.h, 8, 150, '#E2E8F0');
+    }
+
+    f.vy += GRAVITY * dt;
+    f.x = Math.max(80, Math.min(this.arena.width - 80 - f.w, f.x + f.vx * dt));
+
+    const prevGrounded = f.grounded;
+    const prevBottom = f.y + f.h;
+    const preLandVy = f.vy;
+    f.y += f.vy * dt;
+    f.grounded = false;
+
+    let justLanded = false;
+    let landingVy = 0;
+
+    for (const plat of this.arena.platforms) {
+      if (plat.kind === 'destructible' && (plat.hp ?? 1) <= 0) continue;
+      if (!intersectsPlatform(f.x, f.y, f.w, f.h, plat)) continue;
+
+      if (plat.kind === 'oneway') {
+        if (f.vy >= 0 && prevBottom <= plat.y + 12) {
+          if (!prevGrounded && preLandVy > 180) {
+            justLanded = true;
+            landingVy = preLandVy;
+            f.squashX = 1.24;
+            f.squashY = 0.78;
+          }
+          f.y = plat.y - f.h;
+          f.vy = 0;
+          f.grounded = true;
+        }
+        continue;
+      }
+
+      if (f.vy >= 0 && prevBottom <= plat.y + 18) {
+        if (!prevGrounded && preLandVy > 180) {
+          justLanded = true;
+          landingVy = preLandVy;
+          f.squashX = 1.26;
+          f.squashY = 0.76;
+        }
+        f.y = plat.y - f.h;
+        f.vy = 0;
+        f.grounded = true;
+        f.onIce = plat.kind === 'ice';
+      } else if (f.vy < 0 && plat.kind !== 'bounce') {
+        f.y = plat.y + plat.h;
+        f.vy = 0;
+      }
+    }
+
+    // Safety net if celebration started mid-air without ground below
+    if (f.y > this.arena.height - 90) {
+      const sp = this.arena.spawns[0];
+      f.x = sp.x - f.w * 0.5;
+      f.y = sp.y - f.h;
+      f.vy = 0;
+      f.grounded = true;
+    }
+
+    // Apply movement-reactive victory screen-shake & celebratory stomp bursts
+    const pose = f.victoryPose ?? 'wave';
+    const shake = computeVictoryShakeResponse(
+      pose,
+      prevTimer,
+      f.victoryTimer,
+      f.vx,
+      f.vy,
+      f.grounded,
+      justLanded,
+      justJumped,
+      landingVy,
+      f.facing
+    );
+
+    const phaseScale = this.phase === 'gameover' ? 0.55 : 1;
+    this.camera.trauma = Math.min(
+      1,
+      Math.max(this.camera.trauma, shake.minTrauma * phaseScale) +
+        shake.impulseTrauma * phaseScale
+    );
+    this.camera.kickX += shake.kickX * phaseScale;
+    this.camera.kickY += shake.kickY * phaseScale;
+
+    if (justLanded && landingVy > 220) {
+      const fx = f.x + f.w * 0.5;
+      const fy = f.y + f.h;
+      this.particleSystem.emitDust(fx, fy, 10, 190, '#E2E8F0');
+      this.particleSystem.emitRing(fx, fy - 4, 34, f.palette.primary, 0.26);
+      if (this.phase === 'playing') sound.playLand();
+    } else if (shake.impulseTrauma > 0.25 && f.grounded) {
+      this.particleSystem.emitDust(f.x + f.w * 0.5, f.y + f.h, 4, 110, '#CBD5E1');
+      this.particleSystem.emitSparks(
+        f.x + f.w * 0.5,
+        f.y + f.h * 0.35,
+        f.palette.primary,
+        4,
+        160
+      );
+    }
+
+    this.victoryBloomIntensity = Math.max(
+      shake.intensity,
+      this.victoryBloomIntensity * Math.pow(0.12, dt)
+    );
+
+    if (typeof document !== 'undefined') {
+      document.body.dataset.victoryShake = shake.intensity.toFixed(2);
+      document.body.dataset.victoryBloom = this.victoryBloomIntensity.toFixed(2);
+    }
   }
 
   private updateFighter(f: Fighter, input: FighterInputState, dt: number): void {
@@ -1047,7 +1636,9 @@ export class StickFightEngine {
 
     if (spec.isMelee) {
       if (f.weapon === 'katana') {
-        f.vx += f.facing * 260;
+        this.spawnAfterimage(f);
+        f.vx += f.facing * 290;
+        this.spawnAfterimage(f);
         if (this.phase === 'playing') sound.playShoot('katana');
       } else {
         if (this.phase === 'playing') sound.playPunch(f.comboStep === 2);
@@ -1058,10 +1649,10 @@ export class StickFightEngine {
         y: cy,
         facing: f.facing,
         angle: f.facing > 0 ? 0 : Math.PI,
-        radius: spec.range * 0.72,
+        radius: f.weapon === 'katana' ? spec.range * 0.88 : spec.range * 0.72,
         color: spec.color,
-        life: 0.14,
-        maxLife: 0.14,
+        life: f.weapon === 'katana' ? 0.18 : 0.14,
+        maxLife: f.weapon === 'katana' ? 0.18 : 0.14,
       });
 
       // Katana deflects incoming projectiles!
@@ -1074,7 +1665,10 @@ export class StickFightEngine {
             p.vx = -p.vx * 1.15;
             p.vy = -p.vy;
             p.color = '#E879F9';
-            this.particleSystem.emitSparks(p.x, p.y, '#E879F9', 8, 220);
+            this.particleSystem.emitSparks(p.x, p.y, '#E879F9', 12, 260);
+            this.spawnImpactFlash(p.x, p.y, 28, '#E879F9', 9, 'starburst');
+            this.spawnCallout(p.x, p.y - 18, 'DEFLECT!', '#F0ABFC', 1.05);
+            this.camera.kickX += f.facing * 6;
             if (this.phase === 'playing') sound.playParry();
           }
         }
@@ -1094,7 +1688,8 @@ export class StickFightEngine {
             spec.damage * bonus,
             spec.knockbackX * bonus,
             spec.knockbackY,
-            f.facing
+            f.facing,
+            f.comboStep === 2
           );
         }
       }
@@ -1106,6 +1701,27 @@ export class StickFightEngine {
         60,
         spec.damage
       );
+
+      // Knock / detonate dropped physics items inside melee swing arc
+      for (let i = this.pickups.length - 1; i >= 0; i--) {
+        const pk = this.pickups[i];
+        if (Math.abs(pk.x - reachX) < spec.range * 0.72 && Math.abs(pk.y - cy) < 52) {
+          pk.vx += f.facing * (pk.kind === 'explosive_crate' ? 420 : 280);
+          pk.vy = Math.min(pk.vy, -240);
+          pk.angVel = f.facing * 12;
+          pk.grounded = false;
+          pk.parachuteOpen = false;
+          if (pk.kind === 'explosive_crate') {
+            pk.hp -= spec.damage;
+            if (pk.hp <= 0) {
+              this.detonateExplosiveCrate(pk, f.id);
+            } else {
+              pk.fuseTimer = pk.fuseTimer > 0 ? Math.min(pk.fuseTimer, 0.45) : 0.45;
+              this.particleSystem.emitSparks(pk.x, pk.y, '#FACC15', 8, 220);
+            }
+          }
+        }
+      }
     } else if (spec.isBeam) {
       // Rail Laser instant raycast
       if (this.phase === 'playing') sound.playShoot('laser');
@@ -1116,8 +1732,13 @@ export class StickFightEngine {
       const x2 = x1 + dirX * spec.range;
       const y2 = y1 + dirY * spec.range;
 
-      this.beams.push({ x1, y1, x2, y2, color: spec.color, life: 0.22, maxLife: 0.22, width: 14 });
-      this.camera.trauma = Math.min(1, this.camera.trauma + 0.35);
+      this.beams.push({ x1, y1, x2, y2, color: spec.color, life: 0.28, maxLife: 0.28, width: 18 });
+      this.triggerCameraShake('collision', 0.85, -dirX, -dirY);
+      this.screenFlash = { alpha: 0.18, color: '#38BDF8' };
+      this.spawnImpactFlash(x1, y1, 26, '#38BDF8', 8, 'muzzle', f.aimAngle);
+      this.spawnImpactFlash(x2, y2, 34, '#BAE6FD', 10, 'starburst');
+      this.particleSystem.emitRing(x1 + dirX * 28, y1 + dirY * 28, 22, '#38BDF8', 0.22);
+      this.particleSystem.emitRing(x1 + dirX * 160, y1 + dirY * 160, 28, '#BAE6FD', 0.24);
       f.vx -= dirX * spec.recoil;
 
       for (const other of this.fighters) {
@@ -1137,8 +1758,19 @@ export class StickFightEngine {
             spec.damage,
             spec.knockbackX,
             spec.knockbackY,
-            dirX >= 0 ? 1 : -1
+            dirX >= 0 ? 1 : -1,
+            true
           );
+        }
+      }
+
+      // Rail laser instantly detonates explosive crates along the beam
+      for (let i = this.pickups.length - 1; i >= 0; i--) {
+        const pk = this.pickups[i];
+        if (pk.kind !== 'explosive_crate') continue;
+        const dist = pointToSegmentDistance(pk.x, pk.y, x1, y1, x2, y2);
+        if (dist < pk.radius + 14) {
+          this.detonateExplosiveCrate(pk, f.id);
         }
       }
     } else {
@@ -1149,10 +1781,21 @@ export class StickFightEngine {
       const dirX = Math.cos(f.aimAngle);
       const dirY = Math.sin(f.aimAngle);
       f.vx -= dirX * spec.recoil;
-      this.camera.trauma = Math.min(1, this.camera.trauma + (f.weapon === 'shotgun' ? 0.32 : 0.12));
 
-      // Muzzle flash + shell casing
-      this.particleSystem.emitSparks(cx + dirX * 22, cy + dirY * 22, spec.color, 4, 180);
+      const power = f.weapon === 'rocket' ? 1.55 : f.weapon === 'shotgun' ? 1.45 : f.weapon === 'smg' ? 0.85 : 1;
+      if (f.weapon === 'shotgun' || f.weapon === 'rocket') {
+        this.triggerCameraShake('collision', 0.58, -dirX, -dirY);
+      } else {
+        this.camera.trauma = Math.min(1, this.camera.trauma + 0.14);
+        this.camera.kickX -= dirX * (5.5 * power);
+        this.camera.kickY -= dirY * (4 * power);
+      }
+
+      // Directional muzzle flash cone, sparks, smoke puff, and ejected brass casing
+      const muzzleX = cx + dirX * 22;
+      const muzzleY = cy + dirY * 22;
+      this.particleSystem.emitMuzzleFlash(muzzleX, muzzleY, f.aimAngle, spec.color, power);
+      this.spawnImpactFlash(muzzleX, muzzleY, 18 * power, spec.color, 7, 'muzzle', f.aimAngle);
       this.particleSystem.emitCasing(cx + dirX * 8, cy, dirX);
 
       for (let i = 0; i < spec.pellets; i++) {
@@ -1224,32 +1867,26 @@ export class StickFightEngine {
     rawDamage: number,
     kbX: number,
     kbY: number,
-    attackDir: 1 | -1
+    attackDir: 1 | -1,
+    isCrit = false
   ): void {
     const res = resolveHit(target, rawDamage, kbX, kbY, attackDir);
+    const hitX = target.x + target.w * 0.5;
+    const hitY = target.y + target.h * 0.45;
 
     if (res.parried) {
-      this.hitstopTimer = 0.065;
-      this.camera.trauma = Math.min(1, this.camera.trauma + 0.3);
-      target.squashX = 1.2;
-      target.squashY = 0.85;
-      this.particleSystem.emitSparks(
-        target.x + target.w * 0.5,
-        target.y + target.h * 0.4,
-        '#FDE047',
-        14,
-        290
-      );
-      this.particleSystem.emitRing(
-        target.x + target.w * 0.5,
-        target.y + target.h * 0.4,
-        26,
-        '#FDE047',
-        0.25
-      );
+      this.hitstopTimer = 0.075;
+      this.triggerCameraShake('collision', 0.7, attackDir, 0);
+      this.screenFlash = { alpha: 0.14, color: '#FEF08A' };
+      target.squashX = 1.24;
+      target.squashY = 0.82;
+      this.particleSystem.emitSparks(hitX, hitY, '#FDE047', 16, 320);
+      this.particleSystem.emitRing(hitX, hitY, 32, '#FDE047', 0.28);
+      this.spawnImpactFlash(hitX, hitY, 36, '#FDE047', 10, 'starburst');
+      this.spawnCallout(hitX, hitY - 22, 'PARRY!', '#FDE047', 1.15);
       if (attacker) {
-        attacker.stunTimer = 0.32;
-        attacker.vx = -attackDir * 240;
+        attacker.stunTimer = 0.34;
+        attacker.vx = -attackDir * 260;
       }
       if (!target.isBot && this.phase === 'playing') {
         this.gamepadHub.triggerRumble(target.id, 0.45, 90);
@@ -1264,22 +1901,25 @@ export class StickFightEngine {
     target.vx = res.knockbackX;
     target.vy = res.knockbackY;
     target.grounded = false;
-    target.hitFlashTimer = 0.065;
-    target.squashX = 0.78;
-    target.squashY = 1.24;
+    target.hitFlashTimer = 0.075;
+    target.squashX = 0.74;
+    target.squashY = 1.28;
 
     if (attacker) attacker.damageDealt += res.appliedDamage;
 
-    const heavy = res.appliedDamage >= 22 || res.killed;
+    const heavy = res.appliedDamage >= 22 || res.killed || isCrit;
     if (heavy) {
-      this.hitstopTimer = res.killed ? 0.075 : 0.04;
-      this.camera.trauma = Math.min(1, this.camera.trauma + (res.killed ? 0.55 : 0.28));
+      this.hitstopTimer = res.killed ? 0.08 : 0.045;
+      if (!res.killed) {
+        this.triggerCameraShake('collision', isCrit ? 0.82 : 0.58, attackDir, -0.35);
+      }
+    } else {
+      this.camera.kickX += attackDir * 4.5;
     }
 
-    const hitX = target.x + target.w * 0.5;
-    const hitY = target.y + target.h * 0.45;
     if (res.blocked) {
-      this.particleSystem.emitSparks(hitX, hitY, '#38BDF8', 8, 210);
+      this.particleSystem.emitSparks(hitX, hitY, '#38BDF8', 10, 230);
+      this.spawnImpactFlash(hitX, hitY, 20, '#38BDF8', 7, 'starburst');
       if (!target.isBot && this.phase === 'playing') {
         this.gamepadHub.triggerRumble(target.id, 0.25, 65);
       }
@@ -1289,15 +1929,26 @@ export class StickFightEngine {
         hitY,
         attackDir,
         this.getBloodColor(target),
-        heavy ? 1.5 : 0.95
+        heavy ? 1.65 : 1.05
       );
       this.particleSystem.emitSparks(
         hitX,
         hitY,
         target.palette.primary,
-        heavy ? 10 : 5,
-        heavy ? 300 : 180
+        heavy ? 12 : 6,
+        heavy ? 320 : 200
       );
+      this.spawnImpactFlash(
+        hitX,
+        hitY,
+        heavy ? 34 : 21,
+        heavy ? '#FDE047' : '#FFFFFF',
+        heavy ? 9 : 7,
+        'starburst'
+      );
+      if (heavy && !res.killed) {
+        this.spawnCallout(hitX, hitY - 22, isCrit ? 'CRIT!' : 'SMASH!', '#FDE047', 1.1);
+      }
       if (!target.isBot && this.phase === 'playing') {
         this.gamepadHub.triggerRumble(target.id, heavy ? 0.75 : 0.4, heavy ? 140 : 80);
       }
@@ -1314,82 +1965,217 @@ export class StickFightEngine {
     if (!target.alive) return;
     target.alive = false;
     target.hp = 0;
-    target.koTimer = 0.95;
+    target.koTimer = 1.05;
     target.koReason = reason;
     target.deaths += 1;
-    target.ragdollSpin = (target.vx >= 0 ? 1 : -1) * 9.5;
-    target.vy = Math.min(target.vy, -340);
+    target.ragdollSpin = (target.vx >= 0 ? 1 : -1) * 11.5;
+    target.vy = Math.min(target.vy, -360);
 
     if (attacker && attacker.id !== target.id) {
       attacker.kills += 1;
     }
 
-    this.hitstopTimer = 0.07;
-    this.camera.trauma = Math.min(1, this.camera.trauma + 0.55);
+    const dir = target.vx >= 0 ? 1 : -1;
+    this.hitstopTimer = 0.08;
+    if (reason === 'Magma') {
+      this.triggerCameraShake('explosion', 1.3, dir, -1);
+    } else {
+      this.triggerCameraShake('collision', 1.25, dir, -0.6);
+    }
+    this.screenFlash = { alpha: 0.24, color: target.palette.primary };
+
     const cx = target.x + target.w * 0.5;
     const cy = target.y + target.h * 0.5;
-    this.particleSystem.emitBloodSplatter(
+    this.particleSystem.emitBloodSplatter(cx, cy, dir, this.getBloodColor(target), 2.1);
+    this.particleSystem.emitDebris(cx, cy, target.palette.primary, 20, 400);
+    this.particleSystem.emitRing(cx, cy, 46, target.palette.primary, 0.36);
+    this.spawnImpactFlash(cx, cy, 56, '#FFFFFF', 12, 'starburst');
+    this.spawnCallout(
       cx,
-      cy,
-      target.vx >= 0 ? 1 : -1,
-      this.getBloodColor(target),
-      1.8
+      cy - 28,
+      reason === 'Magma' ? 'INCINERATED!' : 'KO!',
+      '#FDE047',
+      1.35
     );
-    this.particleSystem.emitDebris(cx, cy, target.palette.primary, 16, 360);
-    this.particleSystem.emitRing(cx, cy, 36, target.palette.primary, 0.32);
+
+    if (reason === 'Magma') {
+      this.particleSystem.emitExplosion(cx, this.arena.lavaY ?? cy, 120, '#FB923C');
+      if (this.phase === 'playing') sound.playExplosion();
+    }
+
     if (!target.isBot && this.phase === 'playing') {
       this.gamepadHub.triggerRumble(target.id, 0.95, 220);
     }
     if (this.phase === 'playing') sound.playKO();
   }
 
-  private spawnWeaponDrop(x: number, y: number): void {
+  public spawnWeaponDrop(x: number, y: number, forceKind?: ArenaItemKind): void {
+    const choice =
+      forceKind === 'explosive_crate'
+        ? { kind: 'explosive_crate' as const, weaponId: 'rocket' as const }
+        : pickRandomArenaDrop(Math.random, forceKind !== 'weapon');
+    const isCrate = choice.kind === 'explosive_crate';
+    const driftVx = (Math.random() - 0.5) * 95;
     this.pickups.push({
       id: this.nextEntityId++,
-      weaponId: pickRandomWeapon(),
-      x: Math.max(120, Math.min(this.arena.width - 120, x)),
+      kind: choice.kind,
+      weaponId: choice.weaponId,
+      x: Math.max(96, Math.min(this.arena.width - 96, x)),
       y,
-      vy: 60,
+      vx: driftVx,
+      vy: 48,
+      angle: (Math.random() - 0.5) * 0.28,
+      angVel: driftVx * 0.015,
+      radius: isCrate ? 15 : 13,
+      hp: isCrate ? 24 : 999,
+      maxHp: isCrate ? 24 : 999,
+      fuseTimer: 0,
       grounded: false,
+      onIce: false,
       bobPhase: Math.random() * Math.PI * 2,
       parachuteOpen: true,
-      life: 16,
+      life: isCrate ? 20 : 17,
     });
+  }
+
+  private detonateExplosiveCrate(pk: WeaponPickup, ownerId = -1): void {
+    const idx = this.pickups.indexOf(pk);
+    if (idx === -1) return;
+    this.pickups.splice(idx, 1);
+
+    const blastRadius = 132;
+    const baseDamage = 48;
+    this.triggerCameraShake('explosion', 1.32, pk.vx >= 0 ? 1 : -1, -0.8);
+    this.hitstopTimer = Math.max(this.hitstopTimer, 0.065);
+    this.screenFlash = { alpha: 0.3, color: '#FDBA74' };
+
+    this.particleSystem.emitExplosion(pk.x, pk.y, blastRadius, '#FB923C');
+    this.particleSystem.emitDebris(pk.x, pk.y, '#EF4444', 18, 390);
+    this.spawnImpactFlash(pk.x, pk.y, blastRadius * 0.74, '#FDE047', 12, 'explosion');
+    this.spawnCallout(pk.x, pk.y - 26, 'KABOOM!', '#FACC15', 1.3);
+    if (this.phase === 'playing') sound.playExplosion();
+
+    const attacker = ownerId >= 0 ? this.fighters.find((a) => a.id === ownerId) ?? null : null;
+    for (const f of this.fighters) {
+      if (!f.alive) continue;
+      const fx = f.x + f.w * 0.5;
+      const fy = f.y + f.h * 0.5;
+      const d = Math.hypot(fx - pk.x, fy - pk.y);
+      if (d <= blastRadius) {
+        const falloff = Math.max(0.35, 1 - d / blastRadius);
+        const dir: 1 | -1 = fx >= pk.x ? 1 : -1;
+        this.applyHitToFighter(
+          attacker,
+          f,
+          baseDamage * falloff,
+          680 * falloff,
+          -410 * falloff,
+          dir,
+          true
+        );
+      }
+    }
+
+    this.damageDestructiblesInBox(
+      pk.x - blastRadius,
+      pk.y - blastRadius,
+      blastRadius * 2,
+      blastRadius * 2,
+      baseDamage
+    );
+
+    this.impulseDroppedItems(pk.x, pk.y, blastRadius * 1.25, 520, ownerId);
+  }
+
+  private impulseDroppedItems(
+    bx: number,
+    by: number,
+    radius: number,
+    strength: number,
+    ownerId = -1
+  ): void {
+    const chainCrates: WeaponPickup[] = [];
+    for (const item of this.pickups) {
+      const dx = item.x - bx;
+      const dy = item.y - by;
+      const dist = Math.hypot(dx, dy);
+      if (dist > radius) continue;
+      const falloff = Math.max(0.25, 1 - dist / radius);
+      const nx = dist > 1 ? dx / dist : Math.random() > 0.5 ? 1 : -1;
+      const ny = dist > 1 ? dy / dist : -0.8;
+      item.vx += nx * strength * falloff;
+      item.vy = Math.min(item.vy, -240) + ny * strength * 0.55 * falloff;
+      item.angVel += nx * 15 * falloff;
+      item.grounded = false;
+      item.parachuteOpen = false;
+      if (item.kind === 'explosive_crate') {
+        if (dist < radius * 0.58) {
+          chainCrates.push(item);
+        } else {
+          item.fuseTimer = item.fuseTimer > 0 ? Math.min(item.fuseTimer, 0.35) : 0.35;
+        }
+      }
+    }
+    for (const c of chainCrates) {
+      this.detonateExplosiveCrate(c, ownerId);
+    }
   }
 
   private updatePickups(dt: number): void {
     for (let i = this.pickups.length - 1; i >= 0; i--) {
       const pk = this.pickups[i];
+      if (!pk) continue;
       pk.life -= dt;
       if (pk.life <= 0 || pk.y > this.arena.abyssY) {
         this.pickups.splice(i, 1);
         continue;
       }
 
-      if (!pk.grounded) {
-        pk.vy = Math.min(pk.parachuteOpen ? 105 : 540, pk.vy + 450 * dt);
-        pk.y += pk.vy * dt;
+      if (this.arena.lavaY !== null && pk.y + pk.radius >= this.arena.lavaY) {
+        if (pk.kind === 'explosive_crate') {
+          this.detonateExplosiveCrate(pk);
+        } else {
+          this.particleSystem.emitSparks(pk.x, this.arena.lavaY, '#FB923C', 10, 240);
+          this.pickups.splice(i, 1);
+        }
+        continue;
+      }
 
-        for (const plat of this.arena.platforms) {
-          if (plat.kind === 'destructible' && (plat.hp ?? 1) <= 0) continue;
-          if (pk.x >= plat.x && pk.x <= plat.x + plat.w && pk.y + 12 >= plat.y && pk.y - 12 <= plat.y + plat.h) {
-            pk.y = plat.y - 12;
-            pk.vy = 0;
-            pk.grounded = true;
-            pk.parachuteOpen = false;
-            break;
-          }
+      const hadFuse = pk.fuseTimer > 0;
+      const step = stepArenaItemPhysics(pk, this.arena.platforms, this.arena.width, dt);
+
+      if (step.hitBouncePad) {
+        this.particleSystem.emitSparks(pk.x, pk.y + pk.radius, '#10B981', 8, 175);
+        if (this.phase === 'playing') sound.playJump();
+      } else if (step.bounced) {
+        this.particleSystem.emitDust(pk.x, pk.y + pk.radius, 4, 110, '#CBD5E1');
+      }
+
+      if (pk.kind === 'explosive_crate') {
+        if ((hadFuse && pk.fuseTimer <= 0) || (hadFuse && step.highSpeedImpact)) {
+          this.detonateExplosiveCrate(pk);
+          continue;
         }
       }
 
-      // Fighter pickup check
+      // Fighter interaction: push/nudge explosive crates, or equip weapons
       for (const f of this.fighters) {
         if (!f.alive) continue;
         const fcX = f.x + f.w * 0.5;
         const fcY = f.y + f.h * 0.5;
-        if (Math.hypot(fcX - pk.x, fcY - pk.y) < 34) {
+        const dist = Math.hypot(fcX - pk.x, fcY - pk.y);
+        if (pk.kind === 'explosive_crate') {
+          if (dist < 28 && Math.abs(f.vx) > 40) {
+            const pushDir = fcX <= pk.x ? 1 : -1;
+            pk.vx = pushDir * Math.max(Math.abs(pk.vx), Math.abs(f.vx) * 0.72);
+            pk.angVel = pushDir * 6;
+            pk.grounded = false;
+          }
+          continue;
+        }
+
+        if (dist < 34) {
           if (f.weapon === 'fists' || !f.isBot) {
-            // Human picks up if fists OR presses nothing? Let's auto-pickup only if fists or better/different
             if (f.weapon === 'fists' || f.weapon !== pk.weaponId) {
               f.weapon = pk.weaponId;
               f.ammo = WEAPONS[pk.weaponId].ammo;
@@ -1401,6 +2187,10 @@ export class StickFightEngine {
           }
         }
       }
+    }
+
+    if (typeof document !== 'undefined') {
+      document.body.dataset.pickups = String(this.pickups.length);
     }
   }
 
@@ -1449,18 +2239,34 @@ export class StickFightEngine {
       p.x += p.vx * dt;
       p.y += p.vy * dt;
 
-      if (p.isRocket && Math.random() < 0.7) {
+      if (p.isRocket && Math.random() < 0.85) {
         this.particleSystem.spawn({
-          category: 'dust',
+          category: 'fireball',
+          x: p.x - p.vx * dt * 0.4,
+          y: p.y - p.vy * dt * 0.4,
+          vx: -p.vx * 0.14 + (Math.random() * 40 - 20),
+          vy: -p.vy * 0.14 + (Math.random() * 40 - 20),
+          size: 5 + Math.random() * 3,
+          color: Math.random() < 0.5 ? '#FEF08A' : '#FB923C',
+          maxLife: 0.22,
+          gravity: -20,
+          drag: 2.5,
+          shape: 'circle',
+          alpha: 0.9,
+        });
+        this.particleSystem.spawn({
+          category: 'smoke',
           x: p.x,
           y: p.y,
-          vx: -p.vx * 0.1,
-          vy: -p.vy * 0.1,
-          size: 4,
-          color: '#FB923C',
-          maxLife: 0.25,
-          gravity: 0,
+          vx: -p.vx * 0.08 + (Math.random() * 30 - 15),
+          vy: -25 - Math.random() * 25,
+          size: 7 + Math.random() * 5,
+          color: '#475569',
+          maxLife: 0.42,
+          gravity: -55,
+          drag: 2,
           shape: 'circle',
+          alpha: 0.55,
         });
       }
 
@@ -1474,22 +2280,11 @@ export class StickFightEngine {
           if (plat.kind === 'destructible') {
             hitDestructible = true;
             plat.hp = (plat.hp ?? 35) - p.damage;
-            this.particleSystem.emitDebris(p.x, p.y, '#D97706', 5, 190);
+            this.particleSystem.emitDebris(p.x, p.y, '#D97706', 6, 210);
             if ((plat.hp ?? 0) <= 0) {
-              this.particleSystem.emitDebris(
-                plat.x + plat.w * 0.5,
-                plat.y + plat.h * 0.5,
-                '#D97706',
-                18,
-                300
-              );
-              this.particleSystem.emitDust(
-                plat.x + plat.w * 0.5,
-                plat.y + plat.h * 0.5,
-                8,
-                160,
-                '#CBD5E1'
-              );
+              this.breakCrate(plat);
+            } else {
+              this.triggerCameraShake('collision', 0.35, p.vx >= 0 ? 1 : -1, 0.3);
             }
           }
           hitPlatform = true;
@@ -1501,14 +2296,43 @@ export class StickFightEngine {
         if (p.isRocket) {
           this.detonateRocket(p);
         } else {
-          this.particleSystem.emitSparks(p.x, p.y, p.color, 5, 160);
+          this.particleSystem.emitSparks(p.x, p.y, p.color, 6, 190);
           if (!hitDestructible) {
-            this.particleSystem.emitDebris(p.x, p.y, '#64748B', 4, 150);
+            this.particleSystem.emitDebris(p.x, p.y, '#64748B', 5, 175);
           }
         }
         p.active = false;
         continue;
       }
+
+      // Check projectile hits against explosive crates & dropped weapons
+      let hitItem = false;
+      for (let i = this.pickups.length - 1; i >= 0; i--) {
+        const pk = this.pickups[i];
+        if (pk.kind !== 'explosive_crate') continue;
+        if (Math.hypot(p.x - pk.x, p.y - pk.y) <= p.radius + pk.radius + 3) {
+          if (p.isRocket) {
+            this.detonateRocket(p);
+          } else {
+            pk.vx += (p.vx >= 0 ? 1 : -1) * 240;
+            pk.vy = Math.min(pk.vy, -140);
+            pk.angVel += (p.vx >= 0 ? 1 : -1) * 10;
+            pk.grounded = false;
+            pk.parachuteOpen = false;
+            pk.hp -= p.damage;
+            this.particleSystem.emitSparks(p.x, p.y, '#FACC15', 8, 220);
+            if (pk.hp <= 0) {
+              this.detonateExplosiveCrate(pk, p.ownerId);
+            } else {
+              pk.fuseTimer = pk.fuseTimer > 0 ? Math.min(pk.fuseTimer, 0.35) : 0.35;
+            }
+          }
+          p.active = false;
+          hitItem = true;
+          break;
+        }
+      }
+      if (hitItem) continue;
 
       // Check fighter hits
       for (const f of this.fighters) {
@@ -1540,13 +2364,15 @@ export class StickFightEngine {
   }
 
   private detonateRocket(p: Projectile): void {
-    const r = p.explosionRadius || 110;
-    this.camera.trauma = Math.min(1, this.camera.trauma + 0.65);
-    this.hitstopTimer = 0.05;
-    this.particleSystem.emitSparks(p.x, p.y, '#FB923C', 22, 420);
-    this.particleSystem.emitDebris(p.x, p.y, '#64748B', 14, 340);
-    this.particleSystem.emitDust(p.x, p.y, 10, 220, '#94A3B8');
-    this.particleSystem.emitRing(p.x, p.y, r * 0.55, '#FDE047', 0.28);
+    const r = p.explosionRadius || 115;
+    const explodeDir = p.vx >= 0 ? 1 : -1;
+    this.triggerCameraShake('explosion', Math.max(1.15, r / 95), explodeDir, -0.75);
+    this.hitstopTimer = 0.065;
+    this.screenFlash = { alpha: 0.28, color: '#FDBA74' };
+
+    this.particleSystem.emitExplosion(p.x, p.y, r, '#FB923C');
+    this.spawnImpactFlash(p.x, p.y, r * 0.72, '#FDE047', 11, 'explosion');
+    this.spawnCallout(p.x, p.y - 24, 'BOOM!', '#FACC15', 1.25);
     if (this.phase === 'playing') sound.playExplosion();
 
     const attacker = this.fighters.find((a) => a.id === p.ownerId) ?? null;
@@ -1564,12 +2390,27 @@ export class StickFightEngine {
           p.damage * falloff,
           p.knockbackX * falloff,
           p.knockbackY * falloff,
-          dir
+          dir,
+          true
         );
       }
     }
 
     this.damageDestructiblesInBox(p.x - r, p.y - r, r * 2, r * 2, p.damage);
+    this.impulseDroppedItems(p.x, p.y, r * 1.25, 480, p.ownerId);
+  }
+
+  private breakCrate(plat: { x: number; y: number; w: number; h: number }): void {
+    const cx = plat.x + plat.w * 0.5;
+    const cy = plat.y + plat.h * 0.5;
+    const areaFactor = (plat.w * plat.h) / (48 * 48);
+    const debrisCount = Math.min(42, Math.max(20, Math.round(14 + areaFactor * 6)));
+    this.particleSystem.emitDebris(cx, cy, '#D97706', debrisCount, 360);
+    this.particleSystem.emitDust(cx, cy, Math.min(18, Math.round(8 + areaFactor * 2.5)), 210, '#CBD5E1');
+    this.particleSystem.emitRing(cx, cy, Math.min(82, 34 + areaFactor * 12), '#F59E0B', 0.3);
+    const destructionMag = Math.max(0.78, Math.min(1.5, 0.56 + areaFactor * 0.25));
+    this.triggerCameraShake('destruction', destructionMag, 0, 1);
+    if (this.phase === 'playing') sound.playCrateBreak();
   }
 
   private damageDestructiblesInBox(bx: number, by: number, bw: number, bh: number, dmg: number): void {
@@ -1585,20 +2426,9 @@ export class StickFightEngine {
           200
         );
         if ((plat.hp ?? 0) <= 0) {
-          this.particleSystem.emitDebris(
-            plat.x + plat.w * 0.5,
-            plat.y + plat.h * 0.5,
-            '#D97706',
-            18,
-            300
-          );
-          this.particleSystem.emitDust(
-            plat.x + plat.w * 0.5,
-            plat.y + plat.h * 0.5,
-            8,
-            160,
-            '#CBD5E1'
-          );
+          this.breakCrate(plat);
+        } else {
+          this.triggerCameraShake('collision', 0.36, 0, 0.5);
         }
       }
     }
@@ -1622,7 +2452,7 @@ export class StickFightEngine {
     }
 
     for (const f of this.fighters) {
-      if (!f.alive) continue;
+      if (!f.alive || f.victoryPose) continue;
       const fcX = f.x + f.w * 0.5;
       const fcY = f.y + f.h * 0.5;
 
@@ -1643,7 +2473,9 @@ export class StickFightEngine {
           const dist = pointToSegmentDistance(fcX, fcY, laser.x1, laser.y1, laser.x2, laser.y2);
           if (dist < 22 && f.invulnTimer <= 0) {
             f.invulnTimer = 0.25;
-            this.applyHitToFighter(null, f, 28, 360, -260, fcX >= 640 ? 1 : -1);
+            const lDir = fcX >= 640 ? 1 : -1;
+            this.triggerCameraShake('collision', 0.78, lDir, -0.4);
+            this.applyHitToFighter(null, f, 28, 360, -260, lDir);
           }
         }
       }
@@ -1655,11 +2487,70 @@ export class StickFightEngine {
         if (dist < pend.radius + 16 && f.invulnTimer <= 0) {
           f.invulnTimer = 0.28;
           const dir: 1 | -1 = fcX >= pos.x ? 1 : -1;
+          this.triggerCameraShake('explosion', 0.95, dir, -0.5);
           this.applyHitToFighter(null, f, 26, 560, -320, dir);
         }
       }
     }
     void dt;
+  }
+
+  private spawnImpactFlash(
+    x: number,
+    y: number,
+    radius: number,
+    color: string,
+    spikes: number,
+    kind: ImpactFlashEffect['kind'],
+    rot = Math.random() * Math.PI * 2
+  ): void {
+    const slot = this.impactFlashes[this.impactFlashCursor];
+    this.impactFlashCursor = (this.impactFlashCursor + 1) % this.impactFlashes.length;
+    slot.active = true;
+    slot.x = x;
+    slot.y = y;
+    slot.radius = radius;
+    slot.color = color;
+    slot.maxLife = kind === 'explosion' ? 0.2 : kind === 'muzzle' ? 0.09 : 0.14;
+    slot.life = slot.maxLife;
+    slot.spikes = spikes;
+    slot.rot = rot;
+    slot.kind = kind;
+  }
+
+  private spawnCallout(
+    x: number,
+    y: number,
+    text: string,
+    color: string,
+    scale = 1
+  ): void {
+    const slot = this.callouts[this.calloutCursor];
+    this.calloutCursor = (this.calloutCursor + 1) % this.callouts.length;
+    slot.active = true;
+    slot.x = x;
+    slot.y = y;
+    slot.vy = -72;
+    slot.text = text;
+    slot.color = color;
+    slot.maxLife = 0.68;
+    slot.life = slot.maxLife;
+    slot.scale = scale;
+  }
+
+  private spawnAfterimage(f: Fighter): void {
+    const slot = this.afterimages[this.afterimageCursor];
+    this.afterimageCursor = (this.afterimageCursor + 1) % this.afterimages.length;
+    slot.active = true;
+    slot.x = f.x;
+    slot.y = f.y;
+    slot.facing = f.facing;
+    slot.color = f.palette.primary;
+    slot.maxLife = 0.18;
+    slot.life = 0.18;
+    slot.squashX = f.squashX;
+    slot.squashY = f.squashY;
+    this.afterimageSpawnCooldown = 0.028;
   }
 
   private updateEffects(dt: number): void {
@@ -1671,6 +2562,26 @@ export class StickFightEngine {
       this.slashes[i].life -= dt;
       if (this.slashes[i].life <= 0) this.slashes.splice(i, 1);
     }
+    for (let i = 0; i < this.impactFlashes.length; i++) {
+      const f = this.impactFlashes[i];
+      if (!f.active) continue;
+      f.life -= dt;
+      if (f.life <= 0) f.active = false;
+    }
+    for (let i = 0; i < this.callouts.length; i++) {
+      const c = this.callouts[i];
+      if (!c.active) continue;
+      c.life -= dt;
+      c.y += c.vy * dt;
+      c.vy *= Math.pow(0.2, dt);
+      if (c.life <= 0) c.active = false;
+    }
+    for (let i = 0; i < this.afterimages.length; i++) {
+      const g = this.afterimages[i];
+      if (!g.active) continue;
+      g.life -= dt;
+      if (g.life <= 0) g.active = false;
+    }
   }
 
   private updateCamera(dt: number): void {
@@ -1679,7 +2590,34 @@ export class StickFightEngine {
     let targetY = this.arena.height * 0.5;
     let targetZoom = 1.02;
 
-    if (alive.length > 0 && this.phase === 'playing') {
+    if (this.killCamActive && this.killCamWinnerId !== null) {
+      const kcWinner = this.fighters.find((f) => f.id === this.killCamWinnerId);
+      if (kcWinner) {
+        const kc = computeKillCamState(this.killCamElapsed, this.killCamDuration);
+        const winCenterX = kcWinner.x + kcWinner.w * 0.5;
+        const winCenterY = kcWinner.y + kcWinner.h * 0.35;
+        targetX = this.arena.width * 0.5 + (winCenterX - this.arena.width * 0.5) * 0.84;
+        targetY = this.arena.height * 0.5 + (winCenterY - this.arena.height * 0.5) * 0.72;
+        targetZoom = kc.targetZoom;
+      }
+    } else if ((this.victorySequenceActive || this.phase === 'gameover') && this.victoryWinnerId !== null) {
+      const winner = this.fighters.find((f) => f.id === this.victoryWinnerId);
+      if (winner) {
+        const winCenterX = winner.x + winner.w * 0.5;
+        const winCenterY = winner.y + winner.h * 0.2;
+        if (this.phase === 'gameover') {
+          // Frame winner & confetti cleanly beside the centered Match Result card
+          const sideOffset = winCenterX >= this.arena.width * 0.5 ? -290 : 290;
+          targetX = winCenterX + sideOffset;
+          targetY = winCenterY - 15;
+          targetZoom = 1.2;
+        } else {
+          targetX = this.arena.width * 0.5 + (winCenterX - this.arena.width * 0.5) * 0.58;
+          targetY = this.arena.height * 0.5 + (winCenterY - this.arena.height * 0.5) * 0.48;
+          targetZoom = 1.24;
+        }
+      }
+    } else if (alive.length > 0 && this.phase === 'playing') {
       let minX = Infinity;
       let maxX = -Infinity;
       let minY = Infinity;
@@ -1708,7 +2646,7 @@ export class StickFightEngine {
       targetZoom = 0.96;
     }
 
-    const lerp = Math.min(1, dt * 4.5);
+    const lerp = Math.min(1, dt * (this.killCamActive ? 6.0 : 4.5));
     this.camera.x += (targetX - this.camera.x) * lerp;
     this.camera.y += (targetY - this.camera.y) * lerp;
     this.camera.zoom += (targetZoom - this.camera.zoom) * lerp;
@@ -1729,8 +2667,15 @@ export class StickFightEngine {
       this.slashes,
       this.particleSystem.particles,
       this.particleSystem.decals,
+      this.impactFlashes,
+      this.callouts,
+      this.afterimages,
+      this.screenFlash,
       this.camera,
-      this.elapsedTime
+      this.elapsedTime,
+      this.victoryBloomIntensity,
+      this.phase === 'gameover',
+      this.killCamVignette
     );
     this.ctx.restore();
   }

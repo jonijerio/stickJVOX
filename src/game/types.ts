@@ -10,6 +10,8 @@ export type CosmeticPattern = 'solid' | 'stripes' | 'core' | 'viper' | 'crown';
 
 export type BloodStyle = 'crimson' | 'fighter_ink';
 
+export type VictoryPoseType = 'wave' | 'jump' | 'flex';
+
 export type WeaponId =
   | 'fists'
   | 'pistol'
@@ -188,6 +190,8 @@ export interface Fighter {
   aiDesiredX: number;
   aiAttackDecision: boolean;
   aiBlockTimer: number;
+  victoryPose: VictoryPoseType | null;
+  victoryTimer: number;
 }
 
 export interface Projectile {
@@ -214,13 +218,24 @@ export interface Projectile {
   spinAngle?: number;
 }
 
+export type ArenaItemKind = 'weapon' | 'explosive_crate';
+
 export interface WeaponPickup {
   id: number;
+  kind: ArenaItemKind;
   weaponId: WeaponId;
   x: number;
   y: number;
+  vx: number;
   vy: number;
+  angle: number;
+  angVel: number;
+  radius: number;
+  hp: number;
+  maxHp: number;
+  fuseTimer: number;
   grounded: boolean;
+  onIce: boolean;
   bobPhase: number;
   parachuteOpen: boolean;
   life: number;
@@ -248,13 +263,61 @@ export interface SlashArcEffect {
   maxLife: number;
 }
 
+export interface ImpactFlashEffect {
+  active: boolean;
+  x: number;
+  y: number;
+  radius: number;
+  color: string;
+  life: number;
+  maxLife: number;
+  spikes: number;
+  rot: number;
+  kind: 'starburst' | 'muzzle' | 'explosion';
+}
+
+export interface FloatingCallout {
+  active: boolean;
+  x: number;
+  y: number;
+  vy: number;
+  text: string;
+  color: string;
+  life: number;
+  maxLife: number;
+  scale: number;
+}
+
+export interface AfterimageGhost {
+  active: boolean;
+  x: number;
+  y: number;
+  facing: 1 | -1;
+  color: string;
+  life: number;
+  maxLife: number;
+  squashX: number;
+  squashY: number;
+}
+
+export interface ScreenFlashState {
+  alpha: number;
+  color: string;
+}
+
 export type ParticleCategory =
   | 'blood'
   | 'dust'
   | 'debris'
   | 'spark'
   | 'casing'
-  | 'ring';
+  | 'ring'
+  | 'confetti'
+  | 'streamer'
+  | 'ribbon'
+  | 'fireball'
+  | 'smoke'
+  | 'firework';
 
 export interface Particle {
   active: boolean;
@@ -271,7 +334,17 @@ export interface Particle {
   gravity: number;
   drag: number;
   bounce: number;
-  shape: 'circle' | 'spark' | 'shard' | 'casing' | 'ring' | 'droplet';
+  shape:
+    | 'circle'
+    | 'spark'
+    | 'shard'
+    | 'casing'
+    | 'ring'
+    | 'droplet'
+    | 'confetti'
+    | 'streamer'
+    | 'ribbon'
+    | 'star';
   rot: number;
   rotVel: number;
   paintDecalOnHit: boolean;
@@ -295,6 +368,7 @@ export interface MatchConfig {
   roundsToWin: number;
   bloodStyle: BloodStyle;
   showVirtualPsPad: boolean;
+  startingArenaId: string;
   fighterStyles: FighterCosmetic[];
 }
 
@@ -340,6 +414,7 @@ export interface MatchSummary {
   roundsPlayed: number;
   roundsToWin: number;
   durationSeconds: number;
+  victoryPose?: VictoryPoseType;
   playerStats: Array<{
     id: number;
     name: string;

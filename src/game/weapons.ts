@@ -138,6 +138,7 @@ export const DROP_POOL: WeaponId[] = [
   'smg',
   'shotgun',
   'katana',
+  'katana',
   'rocket',
   'laser',
 ];

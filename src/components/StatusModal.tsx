@@ -61,13 +61,22 @@ export const StatusModal: React.FC<StatusModalProps> = ({
   }
 
   if (phase === 'gameover' && summary) {
+    const poseLabel =
+      summary.victoryPose === 'wave'
+        ? 'Victory Wave'
+        : summary.victoryPose === 'jump'
+          ? 'Victory Leap'
+          : summary.victoryPose === 'flex'
+            ? 'Champion Flex'
+            : null;
+
     return (
-      <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/70 p-4">
+      <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/45 p-4">
         <div
           role="dialog"
           aria-modal="true"
           aria-label="Match Result"
-          className="w-full max-w-md rounded-xl bg-[#121622] border border-slate-700 p-6 shadow-[0_24px_60px_rgba(0,0,0,0.85)] animate-modal-pop"
+          className="w-full max-w-md rounded-xl bg-[#121622]/95 border border-slate-700 p-6 shadow-[0_24px_60px_rgba(0,0,0,0.85)] animate-modal-pop"
         >
           <div className="text-center">
             <span className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">
@@ -79,6 +88,11 @@ export const StatusModal: React.FC<StatusModalProps> = ({
             >
               {summary.winnerName} Wins
             </h2>
+            {poseLabel && (
+              <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-md border border-slate-700/80 bg-[#0B0E15] px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-amber-300">
+                Pose: {poseLabel}
+              </div>
+            )}
           </div>
 
           {/* Summary Telemetry Tiles */}
